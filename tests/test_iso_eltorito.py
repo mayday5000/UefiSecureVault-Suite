@@ -268,3 +268,184 @@ def test_ovmf_boots_rebuilt_iso_efi_entry(tmp_path):
                 except Exception:
                     pass
         _cleanup_iso_state()
+
+
+def _capture_synthetic_wim(dest: Path, payload_bytes: int, *, src: Path) -> Path:
+    """Build a real (but synthetic) WIM with wimlib. Not a Windows install.wim."""
+    if src.exists():
+        shutil.rmtree(src)
+    src.mkdir(parents=True)
+    payload = src / "payload.bin"
+    # A real file of the requested size so the split path has something to cut.
+    with payload.open("wb") as fh:
+        fh.write(b"USVWIM")
+        remaining = max(0, payload_bytes - 6)
+        chunk = b"\x00" * (1024 * 1024)
+        while remaining:
+            n = min(remaining, len(chunk))
+            fh.write(chunk[:n])
+            remaining -= n
+    (src / "readme.txt").write_text(
+        "Synthetic install.wim for UefiSecureVault-Suite split/UDF tests.\n"
+        "This is not a Windows installation WIM and is well under 4 GiB.\n"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run_ok(
+        ["wimlib-imagex", "capture", str(src), str(dest), "synthetic", "--compress=none"],
+        capture_output=True,
+    )
+    return dest
+
+
+def _iso_ls(iso: Path, path: str = "/") -> str:
+    result = run(["xorriso", "-indev", str(iso), "-ls", path], capture_output=True)
+    return ((result.stdout or "") + (result.stderr or "")).lower()
+
+
+def _iso_source_names(iso: Path) -> set[str]:
+    names: set[str] = set()
+    for raw in _iso_ls(iso, "/sources").replace("'", " ").split():
+        name = Path(raw.split(";")[0]).name.lower()
+        if name.startswith("install"):
+            names.add(name)
+    return names
+
+
+def _iso_has_udf(iso: Path) -> bool:
+    # UDF volume-recognition sequences live near the start of the image
+    # (BEA01 / NSRxx / TEA01). isoinfo -d often omits them.
+    data = iso.read_bytes()[: 128 * 2048]
+    return b"NSR02" in data or b"NSR03" in data or b"BEA01" in data
+
+
+def _udf_encoder_name() -> str | None:
+    for cmd in ("genisoimage", "mkisofs"):
+        if have_cmd(cmd):
+            result = run([cmd, "-help"], capture_output=True)
+            blob = ((result.stdout or "") + (result.stderr or "")).lower()
+            if "-udf" in blob:
+                return cmd
+    if have_cmd("xorriso"):
+        result = run(["xorriso", "-as", "mkisofs", "-help"], capture_output=True)
+        blob = ((result.stdout or "") + (result.stderr or "")).lower()
+        if "-udf" in blob:
+            return "xorriso"
+    return None
+
+
+def test_split_install_wim_lowered_threshold(tmp_path):
+    """Exercise 11's split path with a synthetic WIM and a lowered threshold.
+
+    This is not a real >4 GiB Windows install.wim. The 4 GiB ISO 9660 ceiling is
+    scaled down via --iso9660-max-file so the auto-split / --split-wim logic
+    runs in a few seconds. --split-wim is forced so the split path is used even
+    when a UDF-capable genisoimage is installed.
+    """
+    if not have_cmd("xorriso"):
+        pytest.skip("xorriso not installed")
+    if not have_cmd("wimlib-imagex"):
+        pytest.skip("wimlib-imagex not installed")
+    _cleanup_iso_state()
+    try:
+        tree = _build_tree(tmp_path, with_efisys=True)
+        wim = tree / "sources" / "install.wim"
+        _capture_synthetic_wim(wim, 2 * 1024 * 1024 + 512 * 1024, src=tmp_path / 'wim_src')
+        wim_size = wim.stat().st_size
+        threshold = 1024 * 1024  # 1 MiB, well under the synthetic WIM
+        assert wim_size > threshold, (wim_size, threshold)
+        vanilla = _vanilla_iso(tmp_path, tree)
+        signed = tmp_path / "signed.efi"
+        signed.write_bytes(b"MZ-SIGNED-EFI-FIXTURE" + b"\x00" * 64)
+        out_iso = tmp_path / "windows_patched.iso"
+        result = run_ok(
+            [
+                str(REPO / "11_extract_and_patch_iso.sh"),
+                "--iso",
+                str(vanilla),
+                "--signed-efi",
+                str(signed),
+                "--output",
+                str(out_iso),
+                "--all",
+                "--force",
+                "--split-wim",
+                "--iso9660-max-file",
+                str(threshold),
+            ],
+            capture_output=True,
+        )
+        log = (result.stdout or "") + (result.stderr or "")
+        assert "splitting" in log.lower() or "split part size" in log.lower(), log
+        sources = ISO_DIR / "sources"
+        assert not (sources / "install.wim").exists(), list(sources.iterdir())
+        swms = sorted(sources.glob("install*.swm"))
+        assert swms, f"no install*.swm after split\n{log}\n{list(sources.iterdir())}"
+        names = _iso_source_names(out_iso)
+        assert "install.swm" in names, names
+        assert "install.wim" not in names, names
+        print(
+            f"NOTE synthetic split: wim_size={wim_size} threshold={threshold} "
+            f"parts={[p.name + '=' + str(p.stat().st_size) for p in swms]}"
+        )
+    finally:
+        _cleanup_iso_state()
+
+
+def test_udf_install_wim_lowered_threshold(tmp_path):
+    """Exercise 11's UDF path with a synthetic WIM and a lowered threshold.
+
+    This is not a real >4 GiB Windows install.wim. When xorriso has no -udf
+    but genisoimage/mkisofs does, 11 rebuilds with that encoder so the large
+    (for the test threshold) WIM stays as install.wim on a UDF volume.
+    """
+    if not have_cmd("xorriso"):
+        pytest.skip("xorriso not installed")
+    encoder = _udf_encoder_name()
+    if not encoder:
+        pytest.skip("no UDF-capable xorriso/genisoimage/mkisofs is installed")
+    if not have_cmd("wimlib-imagex"):
+        pytest.skip("wimlib-imagex not installed")
+    _cleanup_iso_state()
+    try:
+        tree = _build_tree(tmp_path, with_efisys=True)
+        wim = tree / "sources" / "install.wim"
+        _capture_synthetic_wim(wim, 2 * 1024 * 1024 + 512 * 1024, src=tmp_path / 'wim_src')
+        wim_size = wim.stat().st_size
+        threshold = 1024 * 1024
+        assert wim_size > threshold, (wim_size, threshold)
+        vanilla = _vanilla_iso(tmp_path, tree)
+        signed = tmp_path / "signed.efi"
+        signed.write_bytes(b"MZ-SIGNED-EFI-FIXTURE" + b"\x00" * 64)
+        out_iso = tmp_path / "windows_patched.iso"
+        result = run_ok(
+            [
+                str(REPO / "11_extract_and_patch_iso.sh"),
+                "--iso",
+                str(vanilla),
+                "--signed-efi",
+                str(signed),
+                "--output",
+                str(out_iso),
+                "--all",
+                "--force",
+                "--iso9660-max-file",
+                str(threshold),
+            ],
+            capture_output=True,
+        )
+        log = (result.stdout or "") + (result.stderr or "")
+        assert "-udf" in log.lower() or "udf" in log.lower(), log
+        sources = ISO_DIR / "sources"
+        assert (sources / "install.wim").is_file(), list(sources.iterdir())
+        assert not list(sources.glob("install*.swm")), list(sources.iterdir())
+        names = _iso_source_names(out_iso)
+        assert "install.wim" in names, names
+        assert "install.swm" not in names, names
+        assert _iso_has_udf(out_iso), "rebuilt ISO has no UDF volume-recognition sequence"
+        print(
+            f"NOTE synthetic UDF: encoder={encoder} wim_size={wim_size} "
+            f"threshold={threshold} iso_size={out_iso.stat().st_size}"
+        )
+    finally:
+        _cleanup_iso_state()
+
