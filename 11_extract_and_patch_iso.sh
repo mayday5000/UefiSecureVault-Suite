@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # UefiSecureVault-Suite v2 — 11_extract_and_patch_iso.sh
 # Merges 11_extract_and_patch_iso.sh and 11_extract_and_patch_iso_2.sh.
-# Replaces media bootloaders, drops autounattend.xml, rebuilds a UEFI-bootable ISO.
+# Replaces media bootloaders, drops autounattend.xml, and rebuilds a Windows-style
+# UEFI (and optional BIOS) El Torito ISO.
 #
 # Modes (combinable): --extract, --patch, --rebuild, --all, --clean, --force.
 # Default with no mode flags is --all (extract + patch + rebuild).
 # The unpacked tree is kept by default so 13_patch_winpe_image.sh can inject WinPE.
 # --keep-tree is accepted and ignored (deprecated).
 set -euo pipefail
+# mkfs.vfat lives in /usr/sbin on Debian.
+export PATH="/usr/local/bin:/usr/sbin:/sbin:${PATH}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -28,9 +31,14 @@ DO_REBUILD=0
 DO_CLEAN=0
 FORCE=0
 MODE_SET=0
+EFI_ELTORITO="auto"
+SPLIT_WIM=0
+# ISO 9660 level-3 practical file-size ceiling used to decide when to split install.wim.
+ISO9660_MAX_FILE=$((4 * 1024 * 1024 * 1024 - 32 * 1024))
 
 PrintHelp() {
     echo "Usage: $0 [modes] [--iso PATH] [--signed-efi PATH] [--output PATH] [--force] [--keep-tree]"
+    echo "       [--efi-eltorito auto|noprompt|prompt|PATH] [--split-wim]"
     echo ""
     echo "Modes:"
     echo "  --extract      Unpack the vanilla ISO into tmp_iso_extract/."
@@ -49,10 +57,24 @@ PrintHelp() {
     echo "  --iso PATH         Vanilla ISO. Default windows11_vanilla.iso"
     echo "  --signed-efi PATH  Replacement bootloader. Default workspace/winboot_signed.efi"
     echo "  --output PATH      Patched ISO. Default workspace/windows_patched.iso"
+    echo "  --efi-eltorito MODE   EFI El Torito image (default auto):"
+    echo "                     auto      efisys_noprompt.bin, else efisys.bin, else a generated ESP"
+    echo "                     noprompt  efi/microsoft/boot/efisys_noprompt.bin (error if missing)"
+    echo "                     prompt    efi/microsoft/boot/efisys.bin (error if missing)"
+    echo "                     PATH      A file in the unpacked tree, or an absolute path copied in"
+    echo "  --split-wim        If sources/install.wim is larger than the ISO 9660 file-size limit"
+    echo "                     and this xorriso has no UDF, split it to install.swm with wimlib."
+    echo "                     This also happens automatically when a too-large install.wim is found."
     echo ""
     echo "WinPE path:  $0 --extract --patch && ./13_patch_winpe_image.sh && $0 --rebuild"
     echo "ISO-only:    $0 --all"
     echo "Volume label: VAULT_LAB"
+    echo "Rebuild uses efi/microsoft/boot/efisys_noprompt.bin or efisys.bin as the EFI El Torito"
+    echo "image (-e ... -no-emul-boot). BIOS boot is added from boot/etfsboot.com when present"
+    echo "(-b ... -no-emul-boot -boot-load-size 8). If no efisys* image exists, a FAT ESP"
+    echo "containing efi/boot/bootx64.efi is generated and used instead. install.wim files over"
+    echo "the ISO 9660 size limit need UDF; this xorriso may not support -udf, in which case"
+    echo "the WIM is split to .swm (or you can use genisoimage/mkisofs -udf yourself)."
 }
 
 file_sha256() {
@@ -64,6 +86,8 @@ while [ $# -gt 0 ]; do
         --iso) VANILLA_ISO="${2:?}"; shift ;;
         --signed-efi) SIGNED_EFI="${2:?}"; shift ;;
         --output) PATCHED_ISO="${2:?}"; shift ;;
+        --efi-eltorito) EFI_ELTORITO="${2:?}"; shift ;;
+        --split-wim) SPLIT_WIM=1 ;;
         --extract) DO_EXTRACT=1; MODE_SET=1 ;;
         --patch) DO_PATCH=1; MODE_SET=1 ;;
         --rebuild) DO_REBUILD=1; MODE_SET=1 ;;
@@ -184,6 +208,150 @@ DoPatch() {
     echo "[+] Patch complete. Stamp: $STAMP_PATCH"
 }
 
+xorriso_has_udf() {
+    # This Debian xorriso 1.5.6 build does not advertise -udf under -as mkisofs.
+    xorriso -as mkisofs -help 2>&1 | grep -qi -- '-udf'
+}
+
+make_esp_image() {
+    local dest="$1"
+    local bootx64="$2"
+    local dir
+    dir="$(dirname "$dest")"
+    mkdir -p "$dir"
+    if [ ! -f "$bootx64" ]; then
+        echo "[-] Error: cannot generate an ESP El Torito image; $bootx64 is missing."
+        exit 1
+    fi
+    echo "[*] Generating a FAT ESP El Torito image at $dest from $bootx64"
+    dd if=/dev/zero of="$dest" bs=1M count=2 status=none
+    if command -v mkfs.vfat >/dev/null 2>&1; then
+        mkfs.vfat -n EFIBOOT "$dest" >/dev/null
+    else
+        echo "[-] Error: mkfs.vfat is required to generate an ESP image (dosfstools)."
+        exit 1
+    fi
+    if ! command -v mmd >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; then
+        echo "[-] Error: mtools (mmd/mcopy) is required to generate an ESP image."
+        exit 1
+    fi
+    mmd -i "$dest" ::EFI
+    mmd -i "$dest" ::EFI/BOOT
+    mcopy -i "$dest" -D o "$bootx64" ::EFI/BOOT/BOOTX64.EFI
+}
+
+# Resolve the EFI El Torito image path relative to ISO_DIR, generating an ESP if needed.
+# Sets REBUILD_EFI_REL.
+refresh_eltorito_esp() {
+    # Official Windows efisys.bin is a FAT ESP that contains its own
+    # EFI/BOOT/BOOTX64.EFI. After  --patch  replaces the tree's
+    # efi/boot/bootx64.efi, copy that loader into the El Torito image too.
+    local img="${ISO_DIR}/${REBUILD_EFI_REL}"
+    local bootx64="${ISO_DIR}/efi/boot/bootx64.efi"
+    local nsh="${ISO_DIR}/startup.nsh"
+    if [ ! -f "$img" ] || [ ! -f "$bootx64" ]; then
+        return 0
+    fi
+    if ! command -v mdir >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; then
+        echo "[*] mtools not found; leaving $REBUILD_EFI_REL unchanged."
+        return 0
+    fi
+    if ! mdir -i "$img" :: >/dev/null 2>&1; then
+        echo "[*] $REBUILD_EFI_REL is not a FAT image; not injecting bootx64.efi."
+        return 0
+    fi
+    mmd -i "$img" ::EFI >/dev/null 2>&1 || true
+    mmd -i "$img" ::EFI/BOOT >/dev/null 2>&1 || true
+    if mcopy -i "$img" -D o "$bootx64" ::EFI/BOOT/BOOTX64.EFI; then
+        echo "[*] Injected $bootx64 into $REBUILD_EFI_REL as EFI/BOOT/BOOTX64.EFI"
+    else
+        echo "[-] Warning: could not inject bootx64.efi into $REBUILD_EFI_REL"
+        return 0
+    fi
+    if [ -f "$nsh" ]; then
+        mcopy -i "$img" -D o "$nsh" ::startup.nsh || true
+    fi
+}
+
+resolve_efi_eltorito() {
+    local mode="$EFI_ELTORITO"
+    local noprompt="${ISO_DIR}/efi/microsoft/boot/efisys_noprompt.bin"
+    local prompt="${ISO_DIR}/efi/microsoft/boot/efisys.bin"
+    local bootx64="${ISO_DIR}/efi/boot/bootx64.efi"
+    local generated="${ISO_DIR}/efi/microsoft/boot/efisys_lab.bin"
+    REBUILD_EFI_REL=""
+
+    if [ "$mode" = "auto" ]; then
+        if [ -f "$noprompt" ]; then
+            REBUILD_EFI_REL="efi/microsoft/boot/efisys_noprompt.bin"
+        elif [ -f "$prompt" ]; then
+            REBUILD_EFI_REL="efi/microsoft/boot/efisys.bin"
+        else
+            mkdir -p "${ISO_DIR}/efi/microsoft/boot"
+            make_esp_image "$generated" "$bootx64"
+            REBUILD_EFI_REL="efi/microsoft/boot/efisys_lab.bin"
+        fi
+    elif [ "$mode" = "noprompt" ]; then
+        if [ ! -f "$noprompt" ]; then
+            echo "[-] Error: --efi-eltorito noprompt requested but $noprompt is missing."
+            exit 1
+        fi
+        REBUILD_EFI_REL="efi/microsoft/boot/efisys_noprompt.bin"
+    elif [ "$mode" = "prompt" ]; then
+        if [ ! -f "$prompt" ]; then
+            echo "[-] Error: --efi-eltorito prompt requested but $prompt is missing."
+            exit 1
+        fi
+        REBUILD_EFI_REL="efi/microsoft/boot/efisys.bin"
+    else
+        # A path: prefer one already inside the tree; otherwise copy it in.
+        local src="$mode"
+        if [ -f "${ISO_DIR}/${mode#/}" ]; then
+            REBUILD_EFI_REL="${mode#./}"
+            REBUILD_EFI_REL="${REBUILD_EFI_REL#"$ISO_DIR"/}"
+        elif [ -f "$src" ]; then
+            mkdir -p "${ISO_DIR}/efi/microsoft/boot"
+            cp "$src" "${ISO_DIR}/efi/microsoft/boot/efisys_custom.bin"
+            REBUILD_EFI_REL="efi/microsoft/boot/efisys_custom.bin"
+        else
+            echo "[-] Error: --efi-eltorito path not found: $src"
+            exit 1
+        fi
+    fi
+    echo "[*] EFI El Torito image: $REBUILD_EFI_REL"
+}
+
+maybe_split_install_wim() {
+    local wim="${ISO_DIR}/sources/install.wim"
+    [ -f "$wim" ] || return 0
+    local size
+    size=$(stat -c%s "$wim")
+    if [ "$size" -le "$ISO9660_MAX_FILE" ] && [ "$SPLIT_WIM" -eq 0 ]; then
+        return 0
+    fi
+    if xorriso_has_udf && [ "$SPLIT_WIM" -eq 0 ]; then
+        echo "[*] sources/install.wim is $size bytes; this xorriso supports -udf, no split needed."
+        REBUILD_USE_UDF=1
+        return 0
+    fi
+    if [ "$SPLIT_WIM" -eq 1 ] && [ "$size" -le "$ISO9660_MAX_FILE" ]; then
+        echo "[*] --split-wim: splitting sources/install.wim ($size bytes) into .swm parts."
+    else
+        echo "[*] sources/install.wim is $size bytes, over the ISO 9660 file-size limit, and this"
+        echo "    xorriso has no -udf. Splitting it into sources/install*.swm with wimlib."
+    fi
+    if ! command -v wimlib-imagex >/dev/null 2>&1; then
+        echo "[-] Error: wimlib-imagex is required to split a >4GiB install.wim."
+        echo "    Install wimtools, or rebuild with a UDF-capable mkisofs/genisoimage."
+        exit 1
+    fi
+    rm -f "${ISO_DIR}/sources/install.swm" "${ISO_DIR}/sources/"install*.swm
+    # 3800 MiB parts stay safely under the ISO 9660 ceiling.
+    wimlib-imagex split "$wim" "${ISO_DIR}/sources/install.swm" 3800
+    rm -f "$wim"
+    echo "[+] install.wim split; Windows Setup will read install.swm / install2.swm / ..."
+}
+
 DoRebuild() {
     if [ ! -d "$ISO_DIR" ]; then
         echo "[-] Error: $ISO_DIR is missing. Cannot rebuild."
@@ -195,21 +363,40 @@ DoRebuild() {
     out_dir="$(dirname "$PATCHED_ISO")"
     mkdir -p "$out_dir"
     echo "[*] Compiling patched image $PATCHED_ISO from $ISO_DIR ..."
-    # TODO: El Torito currently uses efi/boot/bootx64.efi as the EFI boot image
-    # instead of a dedicated efisys.bin / El Torito EFI system partition image.
-    # Left unchanged in this pass; the existing argument list is preserved, plus
-    # -m to keep .stamp_* files out of the published ISO.
+
+    REBUILD_USE_UDF=0
+    maybe_split_install_wim
+    resolve_efi_eltorito
+    refresh_eltorito_esp
+
+    local xor_args=(
+        -as mkisofs
+        -iso-level 3
+        -J
+        -joliet-long
+        -R
+        -volid "VAULT_LAB"
+        -m '.stamp_*'
+    )
+    if [ "$REBUILD_USE_UDF" -eq 1 ]; then
+        xor_args+=(-udf)
+        echo "[*] Adding -udf so a large install.wim can be stored."
+    fi
+
+    local have_bios=0
+    if [ -f "${ISO_DIR}/boot/etfsboot.com" ]; then
+        have_bios=1
+        xor_args+=(-b boot/etfsboot.com -no-emul-boot -boot-load-size 8)
+        echo "[*] BIOS El Torito image: boot/etfsboot.com"
+    fi
+    if [ "$have_bios" -eq 1 ]; then
+        xor_args+=(-eltorito-alt-boot)
+    fi
+    xor_args+=(-e "$REBUILD_EFI_REL" -no-emul-boot -isohybrid-gpt-basdat)
+    xor_args+=(-o "$PATCHED_ISO" "${ISO_DIR}/")
+
     set +e
-    xorriso -as mkisofs \
-        -no-emul-boot -boot-load-size 4 -boot-info-table \
-        -eltorito-alt-boot \
-        -e efi/boot/bootx64.efi \
-        -no-emul-boot \
-        -isohybrid-gpt-basdat \
-        -volid "VAULT_LAB" \
-        -m '.stamp_*' \
-        -o "$PATCHED_ISO" \
-        "${ISO_DIR}/"
+    xorriso "${xor_args[@]}"
     local rc=$?
     set -e
     if [ ! -s "$PATCHED_ISO" ]; then
@@ -217,8 +404,6 @@ DoRebuild() {
         exit 1
     fi
     if [ "$rc" -ne 0 ]; then
-        # Preserved El Torito args can yield xorriso SORRY ("Isolinux image too small")
-        # on images that have no BIOS boot loader, even after a successful write.
         echo "[*] Note: xorriso exited $rc but wrote $PATCHED_ISO. Continuing."
     fi
     echo "[+] Rebuild complete: $PATCHED_ISO"

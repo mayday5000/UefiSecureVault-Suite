@@ -19,6 +19,7 @@ USV_MEM=4096
 USV_SMP=4
 USV_VM_NAME="windows"
 USV_VBS=auto
+USV_BOOT_ORDER="${USV_BOOT_ORDER:-order=d}"
 
 PrintHelp() {
     echo "Usage: $0 [patched.iso] [--no-nested] [--memory MB] [--smp N] [--disk PATH] [common QEMU lab flags]"

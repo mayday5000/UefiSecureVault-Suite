@@ -78,10 +78,8 @@ qemu_common_init
 USV_EXTRA_ARGS=(
     -drive "file=fat:rw:$USV_WORKSPACE,format=raw"
     -net none
+    -vga std
 )
-if [ "$USV_NOGRAPHIC" -ne 1 ]; then
-    USV_EXTRA_ARGS+=(-vga std)
-fi
 
 qemu_prepare
 qemu_exec

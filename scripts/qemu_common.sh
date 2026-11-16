@@ -35,6 +35,8 @@ USV_PARSE_SHIFT=1
 USV_QEMU_BIN="${USV_QEMU_BIN:-qemu-system-x86_64}"
 USV_QEMU_ARGS=()
 USV_EXTRA_ARGS=()
+USV_BOOT_ORDER=""
+USV_EXTRA_DRIVES=()
 USV_FEATURE_LINES=()
 USV_CLEANUP_REGISTERED=0
 USV_SWTPM_PID=""
@@ -67,6 +69,8 @@ Common QEMU lab flags (02_run_qemu.sh and 12_run_patched_iso_qemu.sh):
   --serial-log PATH    Write the guest serial console to PATH.
   --qmp PATH           QMP unix socket (server, nowait).
   --monitor PATH       HMP monitor unix socket (server, nowait).
+  --boot ORDER         Pass -boot ORDER (for example order=d or c).
+  --extra-drive FILE   Add a raw -drive file=FILE,format=raw (repeatable).
   --dry-run            Print the feature table and full command; do not launch.
   -h, --help           Show script help.
 EOF
@@ -130,6 +134,14 @@ qemu_common_parse() {
             ;;
         --monitor)
             USV_MONITOR_PATH="${2:?--monitor requires a socket path}"
+            USV_PARSE_SHIFT=2
+            ;;
+        --boot)
+            USV_BOOT_ORDER="${2:?--boot requires an order such as d or order=d}"
+            USV_PARSE_SHIFT=2
+            ;;
+        --extra-drive)
+            USV_EXTRA_DRIVES+=("${2:?--extra-drive requires a file path}")
             USV_PARSE_SHIFT=2
             ;;
         --dry-run) USV_DRY_RUN=1 ;;
@@ -873,6 +885,29 @@ qemu_build_args() {
         qemu_feature "gdb" "on" "tcp::$port (waits with -S)"
     else
         qemu_feature "gdb" "off" "not requested"
+    fi
+
+    if [ -n "$USV_BOOT_ORDER" ]; then
+        USV_QEMU_ARGS+=(-boot "$USV_BOOT_ORDER")
+        qemu_feature "boot" "on" "-boot $USV_BOOT_ORDER"
+    else
+        qemu_feature "boot" "off" "firmware default boot order"
+    fi
+
+    local drv i=0
+    for drv in "${USV_EXTRA_DRIVES[@]+"${USV_EXTRA_DRIVES[@]}"}"; do
+        if [ ! -f "$drv" ] && [ "$USV_DRY_RUN" -ne 1 ]; then
+            echo "[-] --extra-drive file not found: $drv" >&2
+            return 1
+        fi
+        # q35 has no implicit PIIX IDE; attach as AHCI/ide-hd with a bootindex
+        # so OVMF can boot a raw FAT/ESP without depending on Virtio.
+        i=$((i + 1))
+        USV_QEMU_ARGS+=(-drive "file=$drv,format=raw,if=none,id=usvextra${i}")
+        USV_QEMU_ARGS+=(-device "ide-hd,drive=usvextra${i},bootindex=${i}")
+    done
+    if [ "${#USV_EXTRA_DRIVES[@]}" -gt 0 ]; then
+        qemu_feature "extra-drive" "on" "${#USV_EXTRA_DRIVES[@]} raw drive(s)"
     fi
 
     if [ "${#USV_EXTRA_ARGS[@]}" -gt 0 ]; then
