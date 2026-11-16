@@ -13,7 +13,7 @@
 #   EFI_SIGNATURE_LIST payload
 #
 # The PKCS#7 is computed over:
-#   VariableName (UTF-16LE, no trailing NUL)
+#   VariableName (UTF-16LE, no trailing NUL; matches sign-efi-sig-list)
 #   || VendorGuid
 #   || Attributes (UINT32 LE)
 #   || EFI_TIME
@@ -74,13 +74,17 @@ auth2_wrap_auth() {
 
     cat "$varname_bin" "$guid_bin" "$attrs_bin" "$timestamp_bin" "$esl" > "$tbs"
 
+    # Include the signer certificate (sign-efi-sig-list does too). OVMF
+    # rejects a Setup Mode PK .auth when the PKCS#7 is built with -nocerts.
     openssl cms -sign -binary \
         -in "$tbs" \
         -signer "$signer_crt" \
         -inkey "$signer_key" \
         -outform DER \
-        -noattr -nosmimecap -nocerts -md sha256 \
+        -noattr -nosmimecap -md sha256 \
         -out "$pkcs7"
+
+    python3 "$(dirname "${BASH_SOURCE[0]}")/cms_to_signed_data.py" "$pkcs7"
 
     pkcs7_len=$(wc -c < "$pkcs7" | tr -d ' [:space:]')
     dw_length=$((4 + 2 + 2 + 16 + pkcs7_len))

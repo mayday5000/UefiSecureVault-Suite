@@ -20,8 +20,12 @@ PrintHelp() {
     echo "  $0 <payload> <target_variable> [--static|--dynamic] [time_offset_seconds]"
     echo ""
     echo "Payload:"
-    echo "  A 32-byte fingerprint (.bin) produced by 06_hash_cert_for_nvram.sh,"
-    echo "  OR any file whose SHA-256 will be taken and wrapped (legacy dbx path)."
+    echo "  An EFI Signature List (.esl), wrapped unchanged (use this for PK, KEK,"
+    echo "  or db certificate enrollment); a 32-byte fingerprint from"
+    echo "  06_hash_cert_for_nvram.sh; or any other file, whose SHA-256 is taken"
+    echo "  and wrapped as a SHA-256 list (legacy dbx / binary-revoke path)."
+    echo "  A file that is not named .esl is still treated as an ESL when its"
+    echo "  SignatureListSize header equals the file size."
     echo ""
     echo "Allowed Target Variables:"
     echo "  db    Authorized whitelist database (append signer/hash)."
@@ -41,6 +45,9 @@ PrintHelp() {
     echo "detached CMS SignedData, then the EFI Signature List payload."
     echo ""
     echo "Examples:"
+    echo "  $0 workspace/PK.esl PK --static"
+    echo "  $0 workspace/KEK.esl KEK --static"
+    echo "  $0 workspace/db.esl db --static"
     echo "  $0 workspace/winboot.efi dbx --static"
     echo "  $0 workspace/certs/cert_fingerprint.bin db --dynamic"
     echo "  $0 workspace/certs/cert_fingerprint.bin db --dynamic -7200"
@@ -127,15 +134,32 @@ echo "[*] Signer: $(basename "$SIGN_CRT")"
 
 cd workspace
 
-# Fingerprints are already 32 raw bytes. Anything else is hashed (legacy binary-revoke path).
 PAYLOAD_SIZE=$(wc -c < "$PAYLOAD" | tr -d ' [:space:]')
-if [ "$PAYLOAD_SIZE" -eq 32 ]; then
-    cp "$PAYLOAD" certs/target_hash.bin
-    echo "[*] Payload already a 32-byte fingerprint."
+IS_ESL=0
+case "$PAYLOAD" in
+    *.esl|*.ESL) IS_ESL=1 ;;
+esac
+if [ "$IS_ESL" -eq 0 ] && [ "$PAYLOAD_SIZE" -ge 28 ]; then
+    # EFI_SIGNATURE_LIST.SignatureListSize is a UINT32 LE at offset 16.
+    LIST_SIZE=$(od -An -t u4 -N 4 -j 16 "$PAYLOAD" | tr -d '[:space:]')
+    if [ -n "$LIST_SIZE" ] && [ "$LIST_SIZE" -eq "$PAYLOAD_SIZE" ]; then
+        IS_ESL=1
+    fi
+fi
+
+if [ "$IS_ESL" -eq 1 ]; then
+    cp "$PAYLOAD" certs/tmp_payload.esl
+    echo "[*] Payload is an EFI Signature List ($PAYLOAD_SIZE bytes); wrapping it unchanged."
 else
-    RAW_HASH=$(sha256sum "$PAYLOAD" | cut -d' ' -f1)
-    echo "[*] Target Binary Content Signature Digest: $RAW_HASH"
-    echo -n "$RAW_HASH" | xxd -r -p > certs/target_hash.bin
+    # Fingerprints are already 32 raw bytes. Anything else is hashed (legacy binary-revoke path).
+    if [ "$PAYLOAD_SIZE" -eq 32 ]; then
+        cp "$PAYLOAD" certs/target_hash.bin
+        echo "[*] Payload already a 32-byte fingerprint."
+    else
+        RAW_HASH=$(sha256sum "$PAYLOAD" | cut -d' ' -f1)
+        echo "[*] Target Binary Content Signature Digest: $RAW_HASH"
+        echo -n "$RAW_HASH" | xxd -r -p > certs/target_hash.bin
+    fi
 fi
 
 if [ "$OP_MODE" == "--static" ]; then
@@ -160,10 +184,12 @@ else
     echo -n "$TIMESTAMP_HEX" | xxd -r -p > certs/tmp_timestamp.bin
 fi
 
-# EFI_SIGNATURE_LIST header for SHA-256: type GUID + ListSize 0x4C + HeaderSize 0 + SigSize 0x30
-echo "2616c4c14c509240aca941f9369343284c0000000000000030000000" | xxd -r -p > certs/tmp_esl_hdr.bin
-uuidgen | tr -d '-' | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(.*\)/\4\3\2\1\6\5\8\7\9/' | xxd -r -p > certs/tmp_owner.bin
-cat certs/tmp_esl_hdr.bin certs/tmp_owner.bin certs/target_hash.bin > certs/tmp_payload.esl
+if [ "$IS_ESL" -ne 1 ]; then
+    # EFI_SIGNATURE_LIST header for SHA-256: type GUID + ListSize 0x4C + HeaderSize 0 + SigSize 0x30
+    echo "2616c4c14c509240aca941f9369343284c0000000000000030000000" | xxd -r -p > certs/tmp_esl_hdr.bin
+    uuidgen | tr -d '-' | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(.*\)/\4\3\2\1\6\5\8\7\9/' | xxd -r -p > certs/tmp_owner.bin
+    cat certs/tmp_esl_hdr.bin certs/tmp_owner.bin certs/target_hash.bin > certs/tmp_payload.esl
+fi
 
 # tmp_varname.bin was already written before cd workspace
 
