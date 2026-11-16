@@ -19,6 +19,8 @@ static EFI_GUID GV_GUID = {
     0x8BE4DF61, 0x93CA, 0x11d2,
     {0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C}
 };
+static EFI_HANDLE g_image;
+
 static EFI_GUID SIG_DB_GUID = {
     0xd719b2cb, 0x3d3a, 0x4596,
     {0xa3, 0xbc, 0xda, 0xd0, 0x0e, 0x67, 0x65, 0x6f}
@@ -310,6 +312,60 @@ static void do_dump(const char *var)
     FreePool(buf);
 }
 
+
+static void emit_status(const char *op, const char *a, const char *b, EFI_STATUS st)
+{
+    char line[280];
+    UINTN p = 0;
+    const char *s;
+    const char *pre = "USV_STATUS ";
+    for (s = pre; *s && p + 1 < sizeof(line); )
+        line[p++] = *s++;
+    for (s = op; *s && p + 1 < sizeof(line); )
+        line[p++] = *s++;
+    if (a && *a) {
+        if (p + 1 < sizeof(line))
+            line[p++] = ' ';
+        for (s = a; *s && p + 1 < sizeof(line); )
+            line[p++] = *s++;
+    }
+    if (b && *b) {
+        if (p + 1 < sizeof(line))
+            line[p++] = ' ';
+        for (s = b; *s && p + 1 < sizeof(line); )
+            line[p++] = *s++;
+    }
+    if (p + 3 < sizeof(line)) {
+        line[p++] = ' ';
+        line[p++] = '0';
+        line[p++] = 'x';
+    }
+    append_hex(line, &p, sizeof(line), (UINT64)st, 8);
+    line[p] = 0;
+    say_ascii(line);
+}
+
+static void do_load(EFI_FILE_HANDLE root, const char *file)
+{
+    EFI_STATUS st;
+    void *buf = NULL;
+    UINTN size = 0;
+    EFI_HANDLE loaded = NULL;
+
+    st = read_file(root, file, &buf, &size);
+    if (EFI_ERROR(st) || !buf) {
+        emit_status("LOAD", file, NULL, st);
+        if (buf)
+            FreePool(buf);
+        return;
+    }
+    st = BS->LoadImage(FALSE, g_image, NULL, buf, size, &loaded);
+    if (!EFI_ERROR(st) && loaded)
+        BS->UnloadImage(loaded);
+    FreePool(buf);
+    emit_status("LOAD", file, NULL, st);
+}
+
 static void run_cmds(EFI_FILE_HANDLE root, char *text, UINTN size)
 {
     UINTN i = 0;
@@ -337,6 +393,8 @@ static void run_cmds(EFI_FILE_HANDLE root, char *text, UINTN size)
             do_set(root, a, b);
         else if (str_eq(op, "DUMP"))
             do_dump(a);
+        else if (str_eq(op, "LOAD"))
+            do_load(root, a[0] ? a : b);
         else
             say_ascii("USV_STATUS unknown-op");
     }
@@ -352,6 +410,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     EFI_STATUS st;
 
     InitializeLib(ImageHandle, SystemTable);
+    g_image = ImageHandle;
     say_ascii("USV_AUTHSET_START");
     st = open_root(ImageHandle, &root);
     if (EFI_ERROR(st) || !root) {

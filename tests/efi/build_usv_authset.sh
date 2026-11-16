@@ -28,7 +28,7 @@ CFLAGS=(
     -I"$INC" -I"$INC/$ARCH"
     -fpic -ffreestanding -fno-stack-protector -fno-stack-check
     -fshort-wchar -mno-red-zone -maccumulate-outgoing-args
-    -DEFI_FUNCTION_WRAPPER -DGNU_EFI_USE_MS_ABI
+    -DGNU_EFI_USE_MS_ABI
     -Wall -Wextra -Wno-unused-parameter
 )
 

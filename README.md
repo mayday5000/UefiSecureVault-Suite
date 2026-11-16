@@ -29,7 +29,7 @@ This repository provides an automated end-to-end framework to construct a privat
 - `16_verify_signatures.sh`: Host-side OpenSSL inspection of a detached `.p7b`, an X.509 certificate, an `.esl` header, or a CMS blob. Modes are `p7b`, `x509`, `esl`, and `cms`.
 - `build_uefi.sh`: Probe-and-install wrapper that builds `SecureManagerApp.efi` and `SignatureParserApp.efi`. It can install QEMU, OVMF, swtpm, and EDK2 dependencies when they are missing. No arguments. Environment: `EDK2_ROOT`, `EDK2_TAG`, `TARGET_ARCH`, `TARGET_TOOLCHAIN`, `BUILD_TARGET`.
 - `build_win32.ps1`: Windows-host equivalent of `14_compile_win32_diagnostics.sh`. Writes objects and executables under `win32/build` and copies `.exe` files into `workspace/`.
-- `tests/run_tests.sh`: Runs the pytest suite (`tests/test_*.py`): Auth2 packet structure, ISO/WinPE idempotency, QEMU dry-run command shape, OVMF mismatch abort, and a headless OVMF+swtpm boot when the toolchain is present.
+- `tests/run_tests.sh`: Runs the pytest suite (`tests/test_*.py`): Auth2 packet structure (including `.esl` passthrough), ISO/WinPE idempotency, Windows-style El Torito catalog and a live OVMF boot of a rebuilt fixture ISO, QEMU dry-run command shape, OVMF mismatch abort, a headless OVMF+swtpm boot, and a live `.auth` enrollment in Setup Mode when the toolchain is present.
 
 ### 2. Native UEFI / EDK2 C Applications (.c & .inf)
 
@@ -270,13 +270,15 @@ The Win32 tools never see this guest. They run later, on a Windows or WinPE boot
 | `--reset-vars` | off | Recopy the VARS template | Drops enrollments. |
 | `--empty-keys` / `--own-pk` | off | Empty VARS template (Setup Mode) | Uses `OVMF_VARS_4M.fd` (or the 2M empty template) instead of the `.ms` keys. Switching templates with an existing store requires `--reset-vars`. |
 | `--sev` / `--tdx` | off | Experimental, conservative | Enabled only in the feature table when a host device or module is present, and refused when mixed with SMM. This lab does **not** emit an untested `-object sev-guest` / TDX machine line. Treat both as skipped unless you have added and tested a host-specific command yourself. |
+| `--boot ORDER` | off | Pass `-boot ORDER` | For example `order=d` or `order=c`. `12` defaults to `order=d` so the ISO is tried first. |
+| `--extra-drive FILE` | none | Add a raw disk | Repeatable. Attached as an AHCI `ide-hd` with a `bootindex` so OVMF can boot a FAT/ESP image without Virtio. |
 | `--dry-run` | off | Print table + command, do not launch | `12` also allows a missing ISO in this mode so the command line can be inspected. |
 
 Shared implementation lives in `scripts/qemu_common.sh`. Existing runner arguments are unchanged: `02` still accepts `--nested`, `--memory`, `--smp`; `12` still accepts `[patched.iso]`, `--no-nested`, `--memory`, `--smp`, `--disk`.
 
-**What the automated tests cover.** `tests/run_tests.sh` (pytest) checks Auth2 packet layout, ISO/WinPE idempotency, dry-run command shape for the flag combinations above, OVMF CODE/VARS mismatch abort, and, when `qemu-system-x86_64`, swtpm, and OVMF are installed, a headless `02` boot with SMM, swtpm, serial, debugcon, and QMP. That live boot asserts QEMU `query-tpm`, OVMF/UEFI evidence in the captured logs, and swtpm cleanup after exit. PCR readout after a TCG or KVM boot is attempted with `tpm2_pcrread` against the saved swtpm state; if those PCRs come back all-zero because of a `startup-clear` reopen, the test skips the PCR assertion rather than inventing measured-boot evidence. KVM, IOMMU, and VBS live paths require a readable `/dev/kvm` and nested virtualization; they are skipped with a reason when those are missing. SEV/TDX boots are not performed.
+**What the automated tests cover.** `tests/run_tests.sh` (pytest) checks Auth2 packet layout (including wrapping an existing `.esl` unchanged), ISO/WinPE idempotency, the Windows-style El Torito catalog on a rebuilt fixture ISO, dry-run command shape for the flag combinations above, OVMF CODE/VARS mismatch abort, and, when `qemu-system-x86_64`, swtpm, and OVMF are installed, a headless `02` boot with SMM, swtpm, serial, debugcon, and QMP. That live boot asserts QEMU `query-tpm`, OVMF/UEFI evidence in the captured logs, and swtpm cleanup after exit. PCR readout after a TCG or KVM boot is attempted with `tpm2_pcrread` against the saved swtpm state; if those PCRs come back all-zero because of a `startup-clear` reopen, the test skips the PCR assertion rather than inventing measured-boot evidence. When OVMF 4M secboot, empty VARS, the EFI Shell, and efitools (`UpdateVars.efi`, `sign-efi-sig-list`, `sbsign`) are present, the suite also enrolls lab-generated and efitools-generated PK/KEK/db `.auth` packets in a live Setup Mode guest, checks `SetupMode=0` plus signed-versus-unsigned EFI after enrollment, and boots a rebuilt fixture ISO far enough for firmware to run the El Torito EFI image (serial marker). KVM, IOMMU, and VBS live paths require a readable `/dev/kvm` and nested virtualization; they are skipped with a reason when those are missing. SEV/TDX boots are not performed.
 
-**Not implemented, or intentionally untouched.** El Torito on `11_extract_and_patch_iso.sh` still uses `efi/boot/bootx64.efi` as the EFI boot image; the Isolinux-size warning on tiny fixture ISOs is tolerated when the output ISO was written (see the TODO in that script). This tree does not invent additional OVMF `fw_cfg` names beyond the two listed under `--fw-protections` plus explicit `--fw-cfg` pass-through.
+**Not implemented, or intentionally untouched.** This tree does not invent additional OVMF `fw_cfg` names beyond the two listed under `--fw-protections` plus explicit `--fw-cfg` pass-through.
 
 ## Signature Lists, Keys, and What Each Tool Is Reading
 
@@ -490,9 +492,14 @@ Use cases: enroll keys with `SecureManagerApp.efi`; inspect packets with `Signat
 
 Purpose: build a signed `EFI_VARIABLE_AUTHENTICATION_2` packet for `db`, `dbx`, `PK`, or `KEK`.
 
-Use cases: a User Mode whitelist append; a hash blacklist; a backdated packet that the `dbt` counter must reject.
+Use cases: enroll a certificate ESL as PK/KEK/db; a User Mode whitelist append; a hash blacklist; a backdated packet that the `dbt` counter must reject.
+
+If the payload is an EFI Signature List (a `.esl` filename, or a file whose `SignatureListSize` at offset 16 equals the file size), it is wrapped unchanged. Any other payload is hashed: a 32-byte file is used as a SHA-256 digest, otherwise the file is hashed first, and that digest is placed in a SHA-256 ESL. The PKCS#7 is a bare SignedData SEQUENCE (the CMS ContentInfo wrapper is stripped) and includes the signer certificate; both are required for OVMF to accept a Setup Mode PK `.auth`. `--static` timestamps are comparable with `sign-efi-sig-list -t "2026-10-04 23:30:00"`.
 
 ```
+./03_generate_auth_update.sh workspace/PK.esl PK --static
+./03_generate_auth_update.sh workspace/KEK.esl KEK --static
+./03_generate_auth_update.sh workspace/db.esl db --static
 ./03_generate_auth_update.sh workspace/winboot.efi dbx --static
 ./03_generate_auth_update.sh workspace/certs/cert_fingerprint.bin db --dynamic
 ./03_generate_auth_update.sh workspace/certs/cert_fingerprint.bin db --dynamic -7200
@@ -677,6 +684,10 @@ Purpose: unpack a vanilla ISO, embed `autounattend.xml`, replace the bootloader,
 ```
 
 `--all` (the default) is the ISO-only path: extract, patch, and rebuild. The WinPE path is `--extract --patch`, then `13`, then `--rebuild`. `--extract` / `--all` refuse to re-extract over `.stamp_winpe` unless `--force`. `--keep-tree` is deprecated and ignored. `--clean` deletes the tree and `tmp_iso_state/`.
+
+Rebuild writes a Windows-style El Torito image with `xorriso -as mkisofs -iso-level 3 -J -joliet-long -R`. The EFI boot image is `efi/microsoft/boot/efisys_noprompt.bin` when present, otherwise `efisys.bin` (`--efi-eltorito auto|noprompt|prompt|PATH`). After the tree's `efi/boot/bootx64.efi` is replaced, that loader is also injected into the FAT ESP inside the El Torito image (mtools). If no `efisys*` file exists, a 2 MiB FAT ESP containing `EFI/BOOT/BOOTX64.EFI` is generated and used instead. BIOS boot is added from `boot/etfsboot.com` when that file is present (`-b ... -no-emul-boot -boot-load-size 8`).
+
+Windows install media with `sources/install.wim` larger than the ISO 9660 file-size ceiling (4 GiB minus 32 KiB) need UDF. This tree's Debian `xorriso` typically has no `-udf`; in that case `11` splits `install.wim` into `install*.swm` with `wimlib-imagex split` (part size 3800 MiB), or you can force a split with `--split-wim`. If a UDF-capable `xorriso` / `genisoimage` / `mkisofs` is used and `-udf` is accepted, the large WIM is stored as UDF instead.
 
 #### `12_run_patched_iso_qemu.sh`
 
@@ -1202,16 +1213,18 @@ From the repository root:
 
 ```
 ./tests/run_tests.sh
-./tests/run_tests.sh -k "not test_headless_ovmf"   # skip the live QEMU boot
+./tests/run_tests.sh -k "not test_headless_ovmf and not test_enroll and not test_ovmf_boots"   # skip live QEMU boots
 ```
 
 The suite uses pytest (`python3-pytest` on Debian). It covers:
 
 - `bash -n` and `shellcheck -x` on the lab scripts
-- Auth2 packet structure (`03_generate_auth_update.sh`, `09_sign_db_with_kek.sh`, `scripts/lib/auth2.sh`), including the 16-byte `EFI_TIME` `2026-10-04 23:30:00` UTC, the `WIN_CERTIFICATE_UEFI_GUID` header, and OpenSSL CMS verification
+- Auth2 packet structure (`03_generate_auth_update.sh`, `09_sign_db_with_kek.sh`, `scripts/lib/auth2.sh`), including the 16-byte `EFI_TIME` `2026-10-04 23:30:00` UTC, the `WIN_CERTIFICATE_UEFI_GUID` header, OpenSSL CMS verification, and wrapping an existing `.esl` unchanged (not re-hashed)
 - Idempotent `11_extract_and_patch_iso.sh` / `13_patch_winpe_image.sh` on a fixture ISO
-- QEMU `--dry-run` command shape, `--empty-keys`, and OVMF CODE-mismatch abort unless `--reset-vars` is passed
+- Windows-style El Torito catalog (`xorriso -report_el_torito plain`) for BIOS `etfsboot.com` plus EFI `efisys_noprompt.bin` / `efisys.bin` / a generated ESP, and a live OVMF boot of the rebuilt fixture that prints `USV_ISO_BOOT_OK` on the serial log
+- QEMU `--dry-run` command shape, `--empty-keys`, `--boot` / `--extra-drive`, and OVMF CODE-mismatch abort unless `--reset-vars` is passed
 - A headless OVMF + SMM + swtpm boot when the toolchain is present (see [QEMU lab features](#qemu-lab-features) for what is asserted versus skipped)
+- A live OVMF enrollment of PK/KEK/db `.auth` packets (lab-generated and efitools `sign-efi-sig-list` as a control) in Setup Mode: `SetupMode=0` after PK, persistence on a second boot, rejection of a tampered and a wrong-key `.auth`, and signed versus unsigned EFI once keys are enrolled. The guest helper `tests/efi/UsvAuthSet.c` (built with gnu-efi) performs the `SetVariable` calls; efitools `UpdateVars.efi` is still staged but its argsplit/Print path is unreliable under this EFI Shell. A helper `LoadImage` of signed versus unsigned EFI returned `EFI_INVALID_PARAMETER` on this OVMF, so that image-start check is recorded in the serial log but not treated as a pass/fail assertion. The test is skipped when OVMF 4M secboot, empty VARS, the EFI Shell, gnu-efi, or efitools binaries are missing
 
 ## License
 

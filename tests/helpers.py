@@ -66,3 +66,87 @@ def connect_qmp(path: Path, timeout: float = 40.0):
                 last = exc
         time.sleep(0.2)
     raise TimeoutError(f"QMP not ready at {path}: {last}")
+
+
+def make_fat_image(path: Path, files: dict, size_mb: int = 8) -> Path:
+    """Create a VFAT image and copy host files into it with mtools.
+
+    `files` maps a DOS path (for example "EFI/BOOT/BOOTX64.EFI" or "startup.nsh")
+    to a host Path or to bytes.
+    """
+    import subprocess as sp
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(size_mb * 1024 * 1024))
+    sp.run(["mkfs.vfat", "-n", "USVFAT", str(path)], check=True, capture_output=True)
+    created_dirs = {""}
+    tmp_payloads = []
+    try:
+        for dos, src in files.items():
+            dos = dos.replace("\\", "/").lstrip("/")
+            parent = "/".join(dos.split("/")[:-1])
+            # Create each parent directory once.
+            accum = []
+            if parent:
+                for part in parent.split("/"):
+                    accum.append(part)
+                    rel = "/".join(accum)
+                    if rel not in created_dirs:
+                        sp.run(["mmd", "-i", str(path), f"::{rel}"], check=True, capture_output=True)
+                        created_dirs.add(rel)
+            if isinstance(src, (bytes, bytearray)):
+                tmp = path.parent / f".fatpayload_{len(tmp_payloads)}"
+                tmp.write_bytes(src)
+                tmp_payloads.append(tmp)
+                host = tmp
+            else:
+                host = Path(src)
+            sp.run(
+                ["mcopy", "-i", str(path), "-D", "o", str(host), f"::{dos}"],
+                check=True,
+                capture_output=True,
+            )
+    finally:
+        for tmp in tmp_payloads:
+            tmp.unlink(missing_ok=True)
+    return path
+
+
+def parse_auth2(path: Path) -> dict:
+    """Parse an EFI_VARIABLE_AUTHENTICATION_2 packet."""
+    import struct
+
+    data = Path(path).read_bytes()
+    if len(data) <= 16 + 24:
+        raise ValueError(f"auth file too small: {len(data)}")
+    dw_length, revision, cert_type = struct.unpack_from("<IHH", data, 16)
+    return {
+        "raw": data,
+        "efi_time": data[:16],
+        "dw_length": dw_length,
+        "revision": revision,
+        "cert_type": cert_type,
+        "cert_guid": data[24:40],
+        "pkcs7": data[40 : 16 + dw_length],
+        "esl": data[16 + dw_length :],
+    }
+
+
+def wait_for_serial_marker(log: Path, marker: str, timeout: float, proc=None) -> str:
+    """Poll a serial log until marker appears or timeout. Returns the text so far."""
+    deadline = time.time() + timeout
+    text = ""
+    while time.time() < deadline:
+        if log.exists():
+            text = log.read_text(errors="replace")
+            if marker in text:
+                return text
+        if proc is not None and proc.poll() is not None:
+            if log.exists():
+                text = log.read_text(errors="replace")
+            return text
+        time.sleep(0.4)
+    if log.exists():
+        text = log.read_text(errors="replace")
+    raise TimeoutError(f"serial marker {marker!r} not seen in {timeout}s; have:\n{text[-4000:]}")

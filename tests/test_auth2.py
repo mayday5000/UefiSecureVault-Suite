@@ -18,6 +18,33 @@ WIN_CERT_REVISION = 0x0200
 WIN_CERT_TYPE_EFI_GUID = 0x0EF1
 
 
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def wrap_signed_data_as_content_info(pkcs7: bytes) -> bytes:
+    """Wrap a bare PKCS#7 SignedData SEQUENCE in CMS ContentInfo if needed."""
+    if not pkcs7 or pkcs7[0] != 0x30:
+        return pkcs7
+    i = 1
+    if pkcs7[1] & 0x80:
+        i += 1 + (pkcs7[1] & 0x7F)
+    else:
+        i += 1
+    # ContentInfo's first child is an OID; SignedData's first child is INTEGER version.
+    if i < len(pkcs7) and pkcs7[i] == 0x06:
+        return pkcs7
+    oid = bytes.fromhex("06092a864886f70d010702")  # id-signedData
+    inner = bytes([0xA0]) + _der_len(len(pkcs7)) + pkcs7
+    body = oid + inner
+    return bytes([0x30]) + _der_len(len(body)) + body
+
+
 def parse_auth(path: Path) -> dict:
     data = path.read_bytes()
     assert len(data) > 16 + 24, f"auth file too small: {len(data)}"
@@ -41,7 +68,7 @@ def parse_auth(path: Path) -> dict:
 def openssl_cms_verify(pkcs7: bytes, tbs: bytes, cert: Path, tmp: Path) -> None:
     p7 = tmp / "sig.p7s"
     content = tmp / "tbs.bin"
-    p7.write_bytes(pkcs7)
+    p7.write_bytes(wrap_signed_data_as_content_info(pkcs7))
     content.write_bytes(tbs)
     result = run(
         [
@@ -168,3 +195,25 @@ def test_09_kek_signed_db_auth(lab_certs):
     assert parsed["efi_time"] == STATIC_TIME
     assert parsed["cert_guid"] == PKCS7_GUID
     assert parsed["revision"] == WIN_CERT_REVISION
+
+
+def test_03_esl_wrapped_unchanged(lab_certs):
+    """An .esl payload is wrapped as-is (not re-hashed into a SHA-256 ESL)."""
+    for var in ("PK", "KEK", "db"):
+        esl = WORKSPACE / f"{var}.esl"
+        assert esl.is_file(), esl
+        result = run_ok(
+            [str(REPO / "03_generate_auth_update.sh"), str(esl), var, "--static"],
+            capture_output=True,
+        )
+        text = (result.stdout or "") + (result.stderr or "")
+        assert "wrapping it unchanged" in text, text
+        auth = WORKSPACE / f"update_target_{var}.auth"
+        assert auth.is_file(), result.stdout
+        parsed = parse_auth(auth)
+        assert parsed["efi_time"] == STATIC_TIME
+        assert parsed["revision"] == WIN_CERT_REVISION
+        assert parsed["cert_type"] == WIN_CERT_TYPE_EFI_GUID
+        assert parsed["cert_guid"] == PKCS7_GUID
+        assert parsed["esl"] == esl.read_bytes(), f"{var}.auth ESL suffix does not match {esl}"
+
