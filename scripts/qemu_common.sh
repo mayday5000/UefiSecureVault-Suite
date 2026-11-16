@@ -377,8 +377,10 @@ qemu_has_kvm() {
     [ -e /dev/kvm ] && [ -r /dev/kvm ]
 }
 
-# /dev/kvm can be present but unusable (this host leaves QEMU unresponsive to
-# QMP once -accel kvm is on). Probe with a tiny VM and a QMP handshake.
+# /dev/kvm can be present but unusable. On this class of host a -machine none
+# KVM VM answers QMP, but q35 (the lab machine) hangs after the QMP greeting
+# so -accel kvm is not safe for 02/12. Probe with q35 and a QMP handshake;
+# fall back to TCG when the handshake does not complete.
 USV_KVM_USABLE_CACHED=""
 qemu_kvm_usable() {
     if [ -n "$USV_KVM_USABLE_CACHED" ]; then
@@ -391,7 +393,9 @@ qemu_kvm_usable() {
     fi
     local sock pid rc=1
     sock="$(mktemp -u /tmp/usv-kvmprobe.XXXXXX.sock)"
-    "$USV_QEMU_BIN" -display none -machine none -m 16 -accel kvm         -qmp "unix:$sock,server,nowait" -serial none -monitor none         >/dev/null 2>&1 &
+    "$USV_QEMU_BIN" -display none -machine q35 -m 64 -accel kvm \
+        -qmp "unix:$sock,server,nowait" -serial none -monitor none \
+        >/dev/null 2>&1 &
     pid=$!
     local i
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
@@ -404,16 +408,16 @@ qemu_kvm_usable() {
         sleep 0.1
     done
     if [ -S "$sock" ] && command -v python3 >/dev/null 2>&1; then
-        if python3 -c '
+        if python3 - "$sock" <<'USVKVMPY'
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(2)
 s.connect(sys.argv[1])
 s.recv(4096)
-s.sendall(b"{"execute":"qmp_capabilities"}\n")
+s.sendall(b'{"execute":"qmp_capabilities"}\n')
 r = s.recv(4096)
 sys.exit(0 if b"return" in r else 1)
-' "$sock"
+USVKVMPY
         then
             rc=0
         fi
