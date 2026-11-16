@@ -1,6 +1,6 @@
 # UEFI SECURE VAULT SUITE
 
-Automated UEFI Secure Boot Analysis, Simulation, and Core Forensic Runtime Verification Lab
+UEFI Secure Boot key/PKI lab with Auth2 variable updates, EDK2 apps, Win32 diagnostics, and a QEMU/OVMF lab with swtpm TPM 2.0 measured boot, SMM, VBS/HVCI, IOMMU, and a test suite.
 
 The UEFI Secure Vault Suite is an integrated, low-level security research environment and cryptographic toolchain designed to explore, audit, and simulate the hardware-enforced boundaries of UEFI Secure Boot, the GUID Partition Table (GPT) layout, System Management BIOS (SMBIOS) data structures, and Windows Virtualization-Based Security (VBS / HVCI).
 
@@ -10,11 +10,11 @@ This repository provides an automated end-to-end framework to construct a privat
 
 ### 1. Host Automation & Build Scripts (.sh)
 
-- `00_download_windows_iso.sh`: Interface wrapper utilizing Microsoft REST endpoints to programmatically download pristine evaluation media configurations (`windows10_vanilla.iso` or `windows11_vanilla.iso`). `--win10` and `--win11` select the image. `--url` replaces the placeholder CDN address with a real evaluation ISO URL before a live pull.
+- `00_download_windows_iso.sh`: Curls a vanilla evaluation ISO (`windows10_vanilla.iso` or `windows11_vanilla.iso`). This is not a Microsoft REST client. The built-in placeholder URL is `https://microsoft.com` and must be replaced with `--url <https://...>` before a live pull. `--win10` and `--win11` select the output name.
 - `01_setup_certs.sh`: Generates a custom testing cryptographic public key infrastructure (PK, KEK, db) using RSA-2048 encryption and bundles them into standard binary EFI Signature Lists (`.esl`). No arguments. Private keys stay under `workspace/certs/`.
-- `02_run_qemu.sh`: Bootstraps the QEMU emulator instance with hardware-enforced System Management Mode (SMM) and maps local folders directly into the firmware runtime space. `./workspace` appears in the UEFI shell as `FS0:`. `--nested` adds the Hyper-V enlightenment bits previously kept in `qemu_nested.sh`. `--memory` and `--smp` override the guest shape.
-- `03_generate_auth_update.sh`: Merged dynamic payload builder. It accepts a fingerprint or a binary, a variable target (`db`, `dbx`, `PK`, or `KEK`), and a time-stamping flag (`--static` or `--dynamic`) to construct signed `EFI_VARIABLE_AUTHENTICATION_2` (`.auth`) update containers. A signed second offset such as `-7200` backdates a dynamic packet so the `dbt` counter can reject it. This file absorbs the earlier `_2`, `_3`, and incremental-date generators.
-- `04_extract_ms_certs.sh`: Uses `sbattach --detach` to non-destructively isolate the default embedded Microsoft PKCS#7 certificate chain (`ms_winboot_signature.p7b`) from an unmodified bootloader. Optional argument is the path to `winboot.efi`.
+- `02_run_qemu.sh`: Boots QEMU+OVMF with the workspace FAT volume as `FS0:`. Firmware is staged as a matching CODE+VARS pair under `workspace/ovmf/` (SMM and swtpm TPM 2.0 are on by default). `--nested` forces VBS/HV enlightenments and raises the default guest to 4096 MiB / 4 vCPUs (historical name: `qemu_nested.sh`). `--memory` and `--smp` override the guest shape. Shared lab flags are listed under [QEMU lab features](#qemu-lab-features).
+- `03_generate_auth_update.sh`: Merged dynamic payload builder. It accepts a fingerprint or a binary, a variable target (`db`, `dbx`, `PK`, or `KEK`), and a time-stamping flag (`--static` or `--dynamic`) to construct signed `EFI_VARIABLE_AUTHENTICATION_2` (`.auth`) update containers. A signed second offset such as `-7200` backdates a dynamic packet so the `dbt` counter can reject it. Historical names, no longer in this tree: `03_generate_auth_update_2.sh`, `03_generate_auth_update_3.sh`, and the incremental-date generators.
+- `04_extract_ms_certs.sh`: Uses `sbattach --detach` to non-destructively isolate the default embedded Microsoft PKCS#7 certificate chain (`workspace/certs/extracted/ms_winboot_signature.p7b`) from an unmodified bootloader. Optional argument is the path to `winboot.efi`.
 - `05_sign_custom_winboot.sh`: Strips vendor signatures from a target `winboot.efi` and signs the copy using the local test `db` certificate via `pesign`. The vendor original is left untouched so step 04 can still read it.
 - `06_hash_cert_for_nvram.sh`: Polymorphic script that parses either `.cer` / `.crt` files or `.esl` packages, strips headers automatically, and outputs a compressed, raw 32-byte binary lookup token (`cert_fingerprint.bin`). Any other extension is hashed as raw file bytes.
 - `07_extract_certs_to_esl.sh`: Converts extracted public `.p7b` containers into standalone `.crt` and `.esl` assets so a native chain can be re-injected into the virtual environment.
@@ -22,26 +22,29 @@ This repository provides an automated end-to-end framework to construct a privat
 - `09_sign_db_with_kek.sh`: Packages an existing whitelist `.esl` into an `.auth` envelope signed explicitly by the custom KEK private key, so the update can cross a User Mode lockdown. Optional arguments are the `.esl` path and `db` or `dbx`.
 - `10_simulate_integrity_violation.sh`: Clones an authenticated packet and intentionally flips internal bytes, creating a signature violation to test hardware verification failures. Optional arguments select the valid packet and the corrupted output.
 - `11_extract_and_patch_iso.sh`: Unpacks a vanilla installation disk image, embeds the automated unattend script, injects the custom-signed bootloader, and recompiles a deployment ISO (`windows_patched.iso`). Modes are `--extract`, `--patch`, `--rebuild`, `--all` (the default: extract + patch + rebuild), `--clean`, and `--force`. The unpacked tree is kept by default; `--keep-tree` is accepted and ignored. Stamps in `tmp_iso_extract/` (`.stamp_extract`, `.stamp_patch_iso`, `.stamp_winpe`) make reruns idempotent. `--iso`, `--signed-efi`, and `--output` select the media, the replacement loader, and the output image.
-- `12_run_patched_iso_qemu.sh`: Launches a nested Hyper-V virtual environment by setting extended CPU virtualization pass-through topologies (`hv_synic`, `hv_stimer`, and the rest of the enlightenment set). `--no-nested` drops those bits. `--memory`, `--smp`, and `--disk` shape the guest.
+- `12_run_patched_iso_qemu.sh`: Boots the patched ISO on a persistent qcow2 disk. This script stages OVMF itself; a prior `02_run_qemu.sh` run is no longer required, but an existing root `OVMF_VARS.fd` enrollment is migrated when safe. VBS/HV enlightenments default to auto (on when KVM and nested virtualization are available). `--no-nested` turns them off. `--memory`, `--smp`, and `--disk` shape the guest. Shared lab flags are listed under [QEMU lab features](#qemu-lab-features).
 - `13_patch_winpe_image.sh`: Mounts `boot.wim` index 2, injects the Win32 user-mode diagnostics into `System32`, applies `winpeshl.ini`, and stages the `.efi` applications on the media root. Restores `boot.wim` from `tmp_iso_state/boot.wim.orig` before a redo so injections do not stack, and writes `.stamp_winpe` so a matching rerun is a no-op. The optional argument is the unpacked ISO directory, default `tmp_iso_extract`.
 - `14_compile_win32_diagnostics.sh`: Cross-compiles the Ring 3 verification tools from Linux with `x86_64-w64-mingw32-g++ -O2 -static`, and stages the executables in `workspace/`.
 - `deploy_suite.sh`: Orchestrates the EDK2 build of `SecureManagerApp` and `SignatureParserApp` and stages the `.efi` binaries into `workspace/`. In this tree the same script is also named `15_deploy_uefi_apps.sh`. `EDK2_ROOT`, `TARGET_ARCH`, `TARGET_TOOLCHAIN`, and `BUILD_TARGET` are environment overrides.
 - `16_verify_signatures.sh`: Host-side OpenSSL inspection of a detached `.p7b`, an X.509 certificate, an `.esl` header, or a CMS blob. Modes are `p7b`, `x509`, `esl`, and `cms`.
+- `build_uefi.sh`: Probe-and-install wrapper that builds `SecureManagerApp.efi` and `SignatureParserApp.efi`. It can install QEMU, OVMF, swtpm, and EDK2 dependencies when they are missing. No arguments. Environment: `EDK2_ROOT`, `EDK2_TAG`, `TARGET_ARCH`, `TARGET_TOOLCHAIN`, `BUILD_TARGET`.
+- `build_win32.ps1`: Windows-host equivalent of `14_compile_win32_diagnostics.sh`. Writes objects and executables under `win32/build` and copies `.exe` files into `workspace/`.
+- `tests/run_tests.sh`: Runs the pytest suite (`tests/test_*.py`): Auth2 packet structure, ISO/WinPE idempotency, QEMU dry-run command shape, OVMF mismatch abort, and a headless OVMF+swtpm boot when the toolchain is present.
 
 ### 2. Native UEFI / EDK2 C Applications (.c & .inf)
 
-- `uefi/SecureManagerApp/SecureManagerApp.c` and `.inf`: On-device interactive shell application. A scroll-selection menu enrolls an open-path whitelist (`.esl`), injects a User Mode enveloped update (`.auth`), appends a blacklist entry, or runs the emergency hardware reset wipe. The banner prints Setup Mode or User Mode and the live `dbt` anti-replay counters. Destinations are `P` (PK), `K` (KEK), `D` (db), and `X` (dbx). This file merges `SecureManagerApp.c`, `SecureManagerApp_2.c`, `SecureManagerApp_facxtory_reset_part.c`, and `SecureManagerApp_PrintLiveTimestampCounters_part.c`.
-- `uefi/SignatureParserApp/SignatureParserApp.c` and `.inf`: Low-level parsing engine that decodes binary `.esl` and `.auth` layouts, classifies X.509 and SHA-256 lists, prints owner GUIDs, and walks raw SHA-256 blacklist entries. It also prints the three-gate Image Loader diagram before the file menu. This file merges `SignatureParserApp.c` and `SignatureParserApp_2.c`.
+- `uefi/SecureManagerApp/SecureManagerApp.c` and `.inf`: On-device interactive shell application. A scroll-selection menu enrolls an open-path whitelist (`.esl`), injects a User Mode enveloped update (`.auth`), appends a blacklist entry, or runs the emergency hardware reset wipe. The banner prints Setup Mode or User Mode and the live `dbt` anti-replay counters. Destinations are `P` (PK), `K` (KEK), `D` (db), and `X` (dbx). Historical names, no longer in this tree: `SecureManagerApp_2.c`, `SecureManagerApp_facxtory_reset_part.c`, and `SecureManagerApp_PrintLiveTimestampCounters_part.c`.
+- `uefi/SignatureParserApp/SignatureParserApp.c` and `.inf`: Low-level parsing engine that decodes binary `.esl` and `.auth` layouts, classifies X.509 and SHA-256 lists, prints owner GUIDs, and walks raw SHA-256 blacklist entries. It also prints the three-gate Image Loader diagram before the file menu. Historical name, no longer in this tree: `SignatureParserApp_2.c`.
 
 ### 3. Native Win32 C++ Diagnostic Source Files (.cpp)
 
 These binaries are the Windows-side half of the same chain. They do not enroll keys. They read the objects the firmware already stored, and they show where the running kernel stops forwarding a write.
 
-- `win32/LowLevelBootTools.cpp`: Single elevated inspector. It opens the hidden EFI System Partition through `\\?\GLOBALROOT\SystemPartition\`, lists the ESP root (`--list-root`) and `EFI\Microsoft\Boot` (`--list-boot`), parses `bootmgfw.efi` and runs `WinVerifyTrust` (`--parse-boot-file`, alias `--parse`), copies the loader (`--extract-boot`) and its Authenticode table (`--extract-sig`), copies and enumerates the BCD hive (`--extract-bcd`, `--inspect-bcd`), writes a timeout onto a hive copy (`--modify-timeout`), dumps `PK`, `KEK`, `db`, `dbx`, and `dbt` (`--extract-all-keys`, alias `--extract-hardware-keys`), walks an EFI Signature List (`--parse-esl`), exports the first certificate entry (`--esl-to-cer`), and dumps the raw SMBIOS table (`--dump-smbios`). This file merges `LowLevelBootTools.cpp`, the `Extract_bootmgfw*` series, and the `LowLevelBootTools_extract_esl`, `_wincrypt_cer`, `_wincrypt_cer_extended`, and `_dump_smbios` parts.
+- `win32/LowLevelBootTools.cpp`: Single elevated inspector. It opens the hidden EFI System Partition through `\\?\GLOBALROOT\SystemPartition\`, lists the ESP root (`--list-root`) and `EFI\Microsoft\Boot` (`--list-boot`), parses `bootmgfw.efi` and runs `WinVerifyTrust` (`--parse-boot-file`, alias `--parse`), copies the loader (`--extract-boot`) and its Authenticode table (`--extract-sig`), copies and enumerates the BCD hive (`--extract-bcd`, `--inspect-bcd`), writes a timeout onto a hive copy (`--modify-timeout`), dumps `PK`, `KEK`, `db`, `dbx`, and `dbt` (`--extract-all-keys`, alias `--extract-hardware-keys`), walks an EFI Signature List (`--parse-esl`), exports the first certificate entry (`--esl-to-cer`), and dumps the raw SMBIOS table (`--dump-smbios`). Historical names, no longer in this tree: the `Extract_bootmgfw*` series and the `LowLevelBootTools_extract_esl`, `_wincrypt_cer`, `_wincrypt_cer_extended`, and `_dump_smbios` parts.
 - `win32/ParseSmBios.cpp`: Typed SMBIOS viewer. `--parse-smbios` walks Type 0 (BIOS vendor, version, date) and Type 1 (system manufacturer, product, serial, UUID) through the trailing string pool. `--dump-smbios` on `LowLevelBootTools.exe` is the raw buffer. This tool is the decoded view of that buffer.
 - `win32/WinVerifyTrust.cpp`: Standalone Authenticode check. The only parameter is the file path. It calls `WinVerifyTrust` with UI disabled and revocation checks off, and prints trusted, unsigned, disallowed, or trust-provider failure. `LowLevelBootTools.exe --parse-boot-file` calls the same API after it has already parsed the PE security directory.
 - `win32/VerifyRuntimeBoundaries.cpp`: Acquires `SE_SYSTEM_ENVIRONMENT_NAME` from user space, reads the active `db` whitelist, and attempts an unauthenticated write of the Platform Key. On a VBS-capable boot the write is dropped by the executive, because the request cannot cross from VTL 0 into VTL 1. No switches.
-- `win32/AuditMeasuredBootLog.cpp`: Talks to the TPM through TPM Base Services (`tbs.lib`), pulls the TCG boot log, and prints a focused attestation report for PCR 0, 4, 7, and 11. `--all` is accepted. A guest with no TPM fails `Tbsi_Context_Create` in the open, which is a recorded result, not a hidden error. This file merges both `AuditMeasuredBootLog` revisions.
+- `win32/AuditMeasuredBootLog.cpp`: Talks to the TPM through TPM Base Services (`tbs.lib`), pulls the TCG boot log, and prints a focused attestation report for PCR 0, 4, 7, and 11. `--all` is accepted by the usage text but is a no-op: `wmain` never branches on it, so the report is always the focused PCR set. A guest with no TPM fails `Tbsi_Context_Create` in the open, which is a recorded result, not a hidden error. Historical name, no longer in this tree: the second `AuditMeasuredBootLog` revision as a separate file.
 - `win32/DumpNtfsVolume.cpp`: Opens `\\.\C:` with share-read and share-write, issues `FSCTL_GET_NTFS_VOLUME_DATA`, and dumps the `$MFT` at `MftStartLcn`. `--volume` selects the volume. `--bytes` selects the dump length. A valid record starts with the `FILE` magic. This is the raw-volume path described by the original notebook and shipped here as its own tool.
 
 ### 4. Configuration Manifests (.xml & .ini)
@@ -82,8 +85,10 @@ This environment tests the highest layer of defense: Virtualization-Based Securi
 To execute a complete end-to-end simulation pipeline (downloading, signing, repatching, and verifying an automated Windows 11 installation under customized Secure Boot conditions), run the following sequence from the repository root.
 
 ```
-# Step 1: Download the official vanilla installation media baseline
-./00_download_windows_iso.sh --win11
+# Step 1: Download vanilla evaluation media. This is a curl of --url, not a
+# Microsoft REST client. The placeholder is https://microsoft.com and must be
+# replaced with a real evaluation ISO URL.
+./00_download_windows_iso.sh --win11 --url https://example.invalid/windows11.iso
 
 # Step 2: Extract the original bootloader from the downloaded ISO
 mkdir -p tmp_mnt && sudo mount -o loop windows11_vanilla.iso tmp_mnt
@@ -133,7 +138,7 @@ When VBS is active, Hyper-V removes the physical MMIO addresses of the firmware 
 ## Requirements & Warnings
 
 - Host Virtualization Flags: The bare-metal host must have Intel VT-x/VT-d or AMD SVM enabled, and the Linux kernel must allow nested virtualization (`/sys/module/kvm_intel/parameters/nested` or `kvm_amd` must return `Y` or `1`).
-- Privilege Constraints: Host scripts that mount images or launch QEMU, and every Win32 verification binary, need an elevated Administrator or root context. Firmware reads also need `SE_SYSTEM_ENVIRONMENT_NAME`, which the Win32 tools enable when the token allows it.
+- Privilege Constraints: Loop-mounting an ISO, installing packages, and every Win32 verification binary need an elevated Administrator or root context. QEMU itself can run unprivileged when the user can read `/dev/kvm` (or falls back to TCG). Firmware reads also need `SE_SYSTEM_ENVIRONMENT_NAME`, which the Win32 tools enable when the token allows it. The TPM emulator (`swtpm`) stores state under `workspace/tpm/` and does not need the system `swtpm-localca` certificates for PCR measurements.
 - Research Safety Notice: This suite is intended strictly for educational, testing, and defensive research inside an isolated virtualization lab. Never deploy experimental certificates or execute emergency database wipes on active production host computers. Losing the PK private key on a real motherboard is a one-way door.
 
 ## Bootloader & Startup Internals
@@ -217,17 +222,17 @@ Measured Boot is the record of what ran. Each stage hashes the next one and exte
 
 ![QEMU, OVMF, and the Mutable NVRAM Store](assets/17-qemu-ovmf-nvram.jpg)
 
-The lab does not run on bare metal. It runs inside QEMU with OVMF as the firmware. OVMF is split into two files. `OVMF_CODE.fd` is the firmware code. It is read-only. `OVMF_VARS.fd` is the variable store: PK, KEK, db, dbx, dbt, the Secure Boot mode bit, and the boot order. `02_run_qemu.sh` maps a local copy of that second file into the guest as a writable disk.
+The lab does not run on bare metal. It runs inside QEMU with OVMF as the firmware. OVMF is used as a whole CODE+VARS pair, never mixed across the 4M and 2M families. `02_run_qemu.sh` and `12_run_patched_iso_qemu.sh` source `scripts/qemu_common.sh`, which prefers `OVMF_CODE_4M.secboot.fd` with `OVMF_VARS_4M.ms.fd` (or `OVMF_VARS_4M.fd` when `--empty-keys` / `--own-pk` is set), then a plain 4M pair, then 2M secboot/CODE+VARS. Images are searched in `/usr/share/OVMF`, `/usr/share/edk2/ovmf`, `/usr/share/qemu`, `/usr/share/ovmf`, and the repository root. The live copies are `workspace/ovmf/CODE.fd` (read-only firmware) and `workspace/ovmf/VARS.fd` (the variable store: PK, KEK, db, dbx, dbt, the Secure Boot mode bit, and the boot order). Compatibility copies are also written to `./OVMF_CODE.fd` and `./OVMF_VARS.fd` at the repo root.
 
-Mutable means the file can be written, and those writes survive the next boot. When `SecureManagerApp.efi` enrolls a key or injects an `.auth` packet, the firmware writes the new variable into `OVMF_VARS.fd`. The next time you run `02_run_qemu.sh`, QEMU opens the same file, so the enrollment is still there. A fresh copy from the package would wipe the enrollments. The script keeps an existing `OVMF_VARS.fd` for that reason.
+Mutable means `workspace/ovmf/VARS.fd` can be written, and those writes survive the next boot. When `SecureManagerApp.efi` enrolls a key or injects an `.auth` packet, the firmware writes the new variable into that file. The next launch reuses it. A source CODE hash is stamped beside the pair; if the CODE image changes, the runner aborts rather than mixing a new firmware with an old store, unless you pass `--reset-vars` (which recopies the VARS template and drops enrollments). `12_run_patched_iso_qemu.sh` stages the same pair itself. If `workspace/ovmf/VARS.fd` is missing and a previous run left `./OVMF_VARS.fd` at the repo root, that enrollment is migrated when the family still matches.
 
-The workspace directory is mapped as a FAT volume. In the UEFI shell it appears as `FS0:`. `SecureManagerApp.efi` and `SignatureParserApp.efi` live there. You start them from the shell after the firmware has already loaded. They read and write the variables that sit in the mutable `OVMF_VARS.fd`. The host scripts build the `.esl` and `.auth` files that those apps consume. The apps are the only place the lab enrolls or inspects the policy from inside the firmware environment.
+On `02_run_qemu.sh`, the workspace directory is mapped as a FAT volume. In the UEFI shell it appears as `FS0:`. `SecureManagerApp.efi` and `SignatureParserApp.efi` live there. You start them from the shell after the firmware has already loaded. They read and write the variables that sit in the mutable VARS store. The host scripts build the `.esl` and `.auth` files that those apps consume. The apps are the only place the lab enrolls or inspects the policy from inside the firmware environment.
 
 ```
 host
-  OVMF_CODE.fd          (read-only firmware)
-  OVMF_VARS.fd          (mutable NVRAM: PK, KEK, db, dbx, dbt)
-  workspace/            (FAT, appears as FS0:)
+  workspace/ovmf/CODE.fd   (read-only firmware)
+  workspace/ovmf/VARS.fd   (mutable NVRAM: PK, KEK, db, dbx, dbt)
+  workspace/               (FAT, appears as FS0: on the 02 runner)
         |
         v
 QEMU + OVMF
@@ -239,6 +244,39 @@ QEMU + OVMF
 ```
 
 The Win32 tools never see this guest. They run later, on a Windows or WinPE boot that may or may not have VBS. The QEMU path is the controlled place where the policy is built and enrolled. The Win32 path is the place where the result of that policy is read back.
+
+## QEMU lab features
+
+`02_run_qemu.sh` and `12_run_patched_iso_qemu.sh` share the flags below. Every launch prints a feature table (`feature`, `state` = on / off / skipped, and a reason) and, with `--dry-run`, the full QEMU and swtpm command lines without starting either process. Only documented OVMF `fw_cfg` names from EDK2 `OvmfPkg/RUNTIME_CONFIG.md` are hard-wired; unknown names are not invented.
+
+| Flag | Default | What it does | Notes |
+| --- | --- | --- | --- |
+| `--tpm` / `--no-tpm` | on | swtpm TPM 2.0, QEMU `tpm-crb` | State is `workspace/tpm/<vm>/`. `02` uses `shell`, `12` uses `windows`. An EXIT trap stops the daemon and leaves the state dir in place. EK/platform certificates are authored when `swtpm_localca` is usable; otherwise setup retries without certificates. PCR measurements still work. |
+| `--tpm-tis` | off | Use `tpm-tis` instead of `tpm-crb` |  |
+| `--smm` / `--no-smm` | on | `-machine q35,smm=on` and `cfi.pflash01,secure=on` | Machine options are merged into a single `-machine` argument. CODE is pflash unit 0 readonly; VARS is unit 1 writable. |
+| `--vbs auto\|on\|off` | auto | KVM + nested Hyper-V enlightenments | auto turns them on only when `/dev/kvm` is readable and `kvm_intel`/`kvm_amd` nested is `Y` or `1`. CPU is `host,+vmx` or `host,+svm` with `hv-passthrough` when QEMU accepts that property, otherwise the explicit set `hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-synic,hv-stimer,hv-time,hv-frequencies,hv-tlbflush,hv-ipi`. KVM is enabled only when a short QMP probe against a tiny `-accel kvm` VM succeeds. `/dev/kvm` can be present but unusable; in that case the runner falls back to TCG (`-cpu max`) and VBS/IOMMU are skipped. |
+| `--nested` (`02` only) | off | Force `--vbs on` and default 4096 MiB / 4 vCPUs | A later `--memory` / `--smp` still overrides the shape. Historical name: `qemu_nested.sh`. |
+| `--no-nested` (`12` only) | off | Force `--vbs off` |  |
+| `--iommu` | off | Intel IOMMU + `kernel-irqchip=split` | Only with KVM: `-device intel-iommu,intremap=on,caching-mode=on`. Without KVM the feature is skipped. |
+| `--fw-protections` | off | Two documented fw_cfg knobs | `opt/ovmf/PcdSetNxForStack,string=yes` and `opt/org.tianocore/EnableLegacyLoader,string=no`. `UninstallMemAttrProtocol` is not turned on. |
+| `--fw-cfg SPEC` | none | Pass-through `-fw_cfg SPEC` | Repeatable. `SPEC` is `name=...,string=...` or `name=...,file=...`. |
+| `--smbios-profile FILE` | none | Lines become `-smbios` arguments | `profiles/smbios_lab.conf` is a type 0/1/2/3 example. Blank lines and `#` comments are ignored. |
+| `--acpitable FILE` | none | `-acpitable file=FILE` | Repeatable pass-through. |
+| `--debugcon [PATH]` | off | isa-debugcon at I/O `0x402` | Default path: `workspace/logs/ovmf_debug.log`. Debian release OVMF often writes nothing here; an empty file is not evidence of a failed boot. |
+| `--gdb` / `--gdb-port PORT` | off | Wait for gdb (`-S`) | `--gdb` uses TCP 1234. |
+| `--nographic` | off | `-display none` | Use `--serial-log PATH` in tests; otherwise serial is `mon:stdio`. `12` also drops the HDA audio device in this mode. |
+| `--serial-log PATH` | off | Guest serial to a file |  |
+| `--qmp PATH` / `--monitor PATH` | off | QMP or HMP unix socket | `server,nowait`. |
+| `--reset-vars` | off | Recopy the VARS template | Drops enrollments. |
+| `--empty-keys` / `--own-pk` | off | Empty VARS template (Setup Mode) | Uses `OVMF_VARS_4M.fd` (or the 2M empty template) instead of the `.ms` keys. Switching templates with an existing store requires `--reset-vars`. |
+| `--sev` / `--tdx` | off | Experimental, conservative | Enabled only in the feature table when a host device or module is present, and refused when mixed with SMM. This lab does **not** emit an untested `-object sev-guest` / TDX machine line. Treat both as skipped unless you have added and tested a host-specific command yourself. |
+| `--dry-run` | off | Print table + command, do not launch | `12` also allows a missing ISO in this mode so the command line can be inspected. |
+
+Shared implementation lives in `scripts/qemu_common.sh`. Existing runner arguments are unchanged: `02` still accepts `--nested`, `--memory`, `--smp`; `12` still accepts `[patched.iso]`, `--no-nested`, `--memory`, `--smp`, `--disk`.
+
+**What the automated tests cover.** `tests/run_tests.sh` (pytest) checks Auth2 packet layout, ISO/WinPE idempotency, dry-run command shape for the flag combinations above, OVMF CODE/VARS mismatch abort, and, when `qemu-system-x86_64`, swtpm, and OVMF are installed, a headless `02` boot with SMM, swtpm, serial, debugcon, and QMP. That live boot asserts QEMU `query-tpm`, OVMF/UEFI evidence in the captured logs, and swtpm cleanup after exit. PCR readout after a TCG or KVM boot is attempted with `tpm2_pcrread` against the saved swtpm state; if those PCRs come back all-zero because of a `startup-clear` reopen, the test skips the PCR assertion rather than inventing measured-boot evidence. KVM, IOMMU, and VBS live paths require a readable `/dev/kvm` and nested virtualization; they are skipped with a reason when those are missing. SEV/TDX boots are not performed.
+
+**Not implemented, or intentionally untouched.** El Torito on `11_extract_and_patch_iso.sh` still uses `efi/boot/bootx64.efi` as the EFI boot image; the Isolinux-size warning on tiny fixture ISOs is tolerated when the output ISO was written (see the TODO in that script). This tree does not invent additional OVMF `fw_cfg` names beyond the two listed under `--fw-protections` plus explicit `--fw-cfg` pass-through.
 
 ## Signature Lists, Keys, and What Each Tool Is Reading
 
@@ -345,9 +383,9 @@ Option 3 is the Setup Mode blacklist path, not a substitute for an `.auth`. A ce
 
 The short quick-start is the media path. The firmware-only path does not need an ISO. `01_setup_certs.sh`, `deploy_suite.sh`, and `02_run_qemu.sh` are enough to enroll `db`, then `KEK`, then `PK`, and to watch Option 2 accept a static packet and reject a backdated one. `OVMF_VARS.fd` is the virtual motherboard. Deleting it is the factory reset that does not require a signed PK update. Keep a copy before any enrollment that should be replayed.
 
-The media path starts from a vanilla ISO so the vendor loader can be compared with the lab loader. `04_extract_ms_certs.sh` isolates `ms_winboot_signature.p7b`. `16_verify_signatures.sh` prints that chain on the host. `05_sign_custom_winboot.sh` writes `winboot_signed.efi` without destroying `winboot.efi`. `08_cosign_application.sh` is optional and only meaningful if `sbverify --list` shows two trailers afterward.
+The media path starts from a vanilla ISO so the vendor loader can be compared with the lab loader. `04_extract_ms_certs.sh` isolates `workspace/certs/extracted/ms_winboot_signature.p7b`. `16_verify_signatures.sh` prints that chain on the host. `05_sign_custom_winboot.sh` writes `winboot_signed.efi` without destroying `winboot.efi`. `08_cosign_application.sh` is optional and only meaningful if `sbverify --list` shows two trailers afterward.
 
-`11_extract_and_patch_iso.sh` is the xorriso unpack, patch, and rebuild. It needs `xorriso`. The default `--all` path (extract + patch + rebuild) is for ISO-only work. The WinPE path is `--extract --patch`, then `13_patch_winpe_image.sh`, then `--rebuild`. The tree in `tmp_iso_extract/` is kept by default. `--keep-tree` is deprecated and ignored; `--clean` deletes the tree and `tmp_iso_state/`. Extract writes `.stamp_extract` (SHA-256 of the source ISO) and copies `sources/boot.wim` to `tmp_iso_state/boot.wim.orig`, which is never packed into the ISO. Patch writes `.stamp_patch_iso` from `autounattend.xml` and the signed loader. Matching stamps are skipped unless `--force` is passed. `--all` and `--extract` refuse to extract over a tree that has `.stamp_winpe` unless `--force`. The WinPE script mounts `sources/boot.wim` index 2, restores that original first so injections do not stack, copies `VerifyRuntimeBoundaries.exe`, `AuditMeasuredBootLog.exe` when it exists, and `winpeshl.ini` into `Windows\System32`, copies both `.efi` applications to the ISO root, and writes `.stamp_winpe`. `--rebuild` runs xorriso against the existing tree, which is what puts the injection inside the ISO that step 12 boots. Step 12 will not start without `OVMF_CODE.fd` and `OVMF_VARS.fd` from a prior `02_run_qemu.sh` run.
+`11_extract_and_patch_iso.sh` is the xorriso unpack, patch, and rebuild. It needs `xorriso`. The default `--all` path (extract + patch + rebuild) is for ISO-only work. The WinPE path is `--extract --patch`, then `13_patch_winpe_image.sh`, then `--rebuild`. The tree in `tmp_iso_extract/` is kept by default. `--keep-tree` is deprecated and ignored; `--clean` deletes the tree and `tmp_iso_state/`. Extract writes `.stamp_extract` (SHA-256 of the source ISO) and copies `sources/boot.wim` to `tmp_iso_state/boot.wim.orig`, which is never packed into the ISO. Patch writes `.stamp_patch_iso` from `autounattend.xml` and the signed loader. Matching stamps are skipped unless `--force` is passed. `--all` and `--extract` refuse to extract over a tree that has `.stamp_winpe` unless `--force`. The WinPE script mounts `sources/boot.wim` index 2, restores that original first so injections do not stack, copies `VerifyRuntimeBoundaries.exe`, `AuditMeasuredBootLog.exe` when it exists, and `winpeshl.ini` into `Windows\System32`, copies both `.efi` applications to the ISO root, and writes `.stamp_winpe`. `--rebuild` runs xorriso against the existing tree, which is what puts the injection inside the ISO that step 12 boots. `12_run_patched_iso_qemu.sh` stages OVMF itself under `workspace/ovmf/`; a prior `02_run_qemu.sh` run is no longer required.
 
 `winpeshl.ini` uses the `LaunchApps` comma separator. `cmd.exe /k` keeps the diagnostic window open. `setup.exe` is last. Removing it leaves the lab at the diagnostics and never installs. Putting a diagnostic after `setup.exe` hides the result until setup returns, which is too late for a pre-install measurement.
 
@@ -361,7 +399,7 @@ A crypto-agile log has a different header. If the walk stops immediately on a mo
 
 ## Files that are lab state
 
-`workspace/`, `OVMF_VARS.fd`, `OVMF_CODE.fd`, `tmp_iso_extract/`, `tmp_iso_state/`, `tmp_wim_mount/`, and the vanilla ISOs are generated state, not source. `OVMF_VARS.fd` contains the Platform Key enrollment. `workspace/certs/*.key` is the ability to write that policy. `tmp_iso_state/boot.wim.orig` is the pristine WinPE image used to redo an injection. Neither belongs in a commit. `WinVerifyTrust.cpp` keeps the Microsoft sample copyright line. The rest of the tree is lab code for machines you administer.
+`workspace/` (including `workspace/ovmf/`, `workspace/tpm/`, and `workspace/logs/`), `OVMF_VARS.fd`, `OVMF_CODE.fd`, `tmp_iso_extract/`, `tmp_iso_state/`, `tmp_wim_mount/`, and the vanilla ISOs are generated state, not source. `workspace/ovmf/VARS.fd` (and the compatibility copy `OVMF_VARS.fd`) contains the Platform Key enrollment. `workspace/certs/*.key` is the ability to write that policy. `tmp_iso_state/boot.wim.orig` is the pristine WinPE image used to redo an injection. Neither belongs in a commit. `WinVerifyTrust.cpp` keeps the Microsoft sample copyright line. The rest of the tree is lab code for machines you administer.
 
 ## Per-Tool Reference
 
@@ -376,7 +414,7 @@ Purpose: fetch a pristine evaluation ISO that the rest of the chain treats as th
 Use cases: first run of the lab; replacing a corrupted media file; switching the experiment from Windows 10 to Windows 11.
 
 ```
-./00_download_windows_iso.sh --win11
+./00_download_windows_iso.sh --win11 --url https://example.invalid/eval.iso
 ./00_download_windows_iso.sh --win10 --url https://example.invalid/eval.iso
 ```
 
@@ -393,7 +431,7 @@ Use cases: first run of the lab; replacing a corrupted media file; switching the
   windows11_vanilla.iso
 ```
 
-The stock CDN placeholders must be replaced with a real evaluation URL before a live pull. `--url` does that without editing the script.
+This script is a `curl -L` of the URL you pass. It does not call Microsoft REST endpoints. The built-in placeholder is `https://microsoft.com` and is not a usable ISO. `--url` is required for a live pull.
 
 #### `01_setup_certs.sh`
 
@@ -411,9 +449,9 @@ Use cases: a clean lab identity; regenerating keys after a wipe of `workspace/ce
         v
   openssl + cert-to-efi-sig-list
         |
-        +--> workspace/certs/PK.key  PK.crt  PK.esl
-        +--> workspace/certs/KEK.key KEK.crt KEK.esl
-        +--> workspace/certs/db.key  db.crt  db.esl
+        +--> workspace/certs/PK.key   PK.crt    and workspace/PK.esl
+        +--> workspace/certs/KEK.key  KEK.crt   and workspace/KEK.esl
+        +--> workspace/certs/db.key   db.crt    and workspace/db.esl
 ```
 
 Private keys stay on the host. Only the `.esl` and later `.auth` packets are meant to cross into the guest.
@@ -427,11 +465,13 @@ Use cases: enroll keys with `SecureManagerApp.efi`; inspect packets with `Signat
 ```
 ./02_run_qemu.sh
 ./02_run_qemu.sh --nested --memory 4096 --smp 4
+./02_run_qemu.sh --dry-run --nographic --debugcon --smbios-profile profiles/smbios_lab.conf
 ```
 
 ```
-  OVMF_CODE.fd + OVMF_VARS.fd
+  workspace/ovmf/CODE.fd + VARS.fd
   workspace/  (FAT)
+  workspace/tpm/shell/  (swtpm, default on)
             |
             v
   +------------------+
@@ -444,7 +484,7 @@ Use cases: enroll keys with `SecureManagerApp.efi`; inspect packets with `Signat
   FS0: SignatureParserApp.efi
 ```
 
-`--nested` adds the Hyper-V enlightenment bits that a later Windows guest needs before it will start its own hypervisor.
+`--nested` forces VBS/HV enlightenments and raises the default guest to 4096 MiB / 4 vCPUs. Shared flags (`--tpm`, `--smm`, `--vbs`, `--iommu`, `--fw-protections`, `--dry-run`, and the rest) are documented in [QEMU lab features](#qemu-lab-features).
 
 #### `03_generate_auth_update.sh`
 
@@ -489,7 +529,7 @@ Purpose: detach the vendor PKCS#7 from an unmodified `winboot.efi` without alter
   sbattach --detach
        |
        v
-  workspace/ms_winboot_signature.p7b
+  workspace/certs/extracted/ms_winboot_signature.p7b
 ```
 
 #### `05_sign_custom_winboot.sh`
@@ -541,11 +581,11 @@ Purpose: turn a detached `.p7b` into a `.crt` and an `.esl` the firmware can enr
 ```
 
 ```
-  workspace/ms_winboot_signature.p7b
+  workspace/certs/extracted/ms_winboot_signature.p7b
             |
             v
-  workspace/ms_winboot.crt
-  workspace/ms_winboot.esl
+  workspace/certs/extracted/extracted_ms_db.crt
+  workspace/certs/extracted/extracted_ms_db.esl
 ```
 
 #### `08_cosign_application.sh`
@@ -640,25 +680,28 @@ Purpose: unpack a vanilla ISO, embed `autounattend.xml`, replace the bootloader,
 
 #### `12_run_patched_iso_qemu.sh`
 
-Purpose: boot the patched ISO in a nested Hyper-V-capable guest.
+Purpose: boot the patched ISO on a persistent qcow2 disk. The script stages the OVMF pair itself (see [QEMU lab features](#qemu-lab-features)).
 
 ```
 ./12_run_patched_iso_qemu.sh
 ./12_run_patched_iso_qemu.sh workspace/windows_patched.iso --memory 8192 --smp 4
+./12_run_patched_iso_qemu.sh --dry-run --nographic
 ```
 
 ```
   windows_patched.iso
   windows_virtual_disk.qcow2
+  workspace/ovmf/CODE.fd + VARS.fd
+  workspace/tpm/windows/  (swtpm, default on)
             |
             v
-  QEMU + hv_synic / hv_stimer / ...
+  QEMU (+ HV enlightenments when --vbs auto/on and KVM+nested are available)
             |
             v
   Windows Setup or installed desktop
 ```
 
-`--no-nested` drops the enlightenments for a firmware-only experiment.
+`--no-nested` turns VBS/HV enlightenments off for a firmware-only experiment. `--disk` selects the qcow2 path (created at 64G if missing).
 
 #### `13_patch_winpe_image.sh`
 
@@ -698,7 +741,7 @@ Purpose: cross-compile the six Win32 diagnostics from Linux and stage them in `w
   win32/*.cpp
        |
        v
-  x86_64-w64-mingw32-g++ -O2 -static
+  x86_64-w64-mingw32-g++ -O2 -static -Wall -municode
        |
        v
   workspace/VerifyRuntimeBoundaries.exe
@@ -735,14 +778,14 @@ EDK2_ROOT=/opt/edk2 TARGET_TOOLCHAIN=GCC5 ./deploy_suite.sh
   workspace/SignatureParserApp.efi
 ```
 
-`build_uefi.sh` is the newer probe-and-install wrapper around the same two `.inf` files. It installs QEMU, OVMF, and EDK2 dependencies when they are missing, skips the clone when `edksetup.sh` already exists, and stages the `.efi` files in both `uefi/build` and `workspace/`.
+`build_uefi.sh` is the newer probe-and-install wrapper around the same two `.inf` files. It installs QEMU, OVMF, swtpm, and EDK2 dependencies when they are missing, skips the clone when `edksetup.sh` already exists, and stages the `.efi` files in both `uefi/build` and `workspace/`.
 
 #### `16_verify_signatures.sh`
 
 Purpose: host-side OpenSSL inspection of a detached signature, a certificate, an ESL header, or a CMS blob.
 
 ```
-./16_verify_signatures.sh p7b  workspace/ms_winboot_signature.p7b
+./16_verify_signatures.sh p7b  workspace/certs/extracted/ms_winboot_signature.p7b
 ./16_verify_signatures.sh x509 workspace/certs/db.crt
 ./16_verify_signatures.sh esl  workspace/certs/db.esl
 ./16_verify_signatures.sh cms  packet.pkcs7 signed.bin
@@ -1073,9 +1116,9 @@ What each PCR is holding:
 - PCR 7 is the Secure Boot policy measurement. This is the one that records `PK`, `KEK`, `db`, and `dbx` as they stood when the machine started. A change to the whitelist or the blacklist shows up here.
 - PCR 11 is the BitLocker and VBS measurement. Windows extends it when Virtualization-Based Security or disk encryption policy is applied.
 
-`Tbsi_Context_Create` is the first call. It asks Windows for a handle to a TPM. `0x8028400f` is `TBS_E_TPM_NOT_FOUND`: no TPM is visible to this boot. That is expected in WinPE and in QEMU without a software TPM. The call itself is the test. On a host with no TPM the tool records that status and exits.
+`Tbsi_Context_Create` is the first call. It asks Windows for a handle to a TPM. `0x8028400f` is `TBS_E_TPM_NOT_FOUND`: no TPM is visible to this boot. That is expected in a guest launched with `--no-tpm`. The default `02` / `12` path starts swtpm TPM 2.0, so a later Windows/WinPE boot of that VM should see a TPM unless the guest OS lacks a driver. The call itself is the test. On a host with no TPM the tool records that status and exits.
 
-`Tbsi_Get_TCG_Log` copies the event log once the handle exists. `--all` dumps every event, not only the focus set. Without it, the tool reports only PCR 0, 4, 7, and 11.
+`Tbsi_Get_TCG_Log` copies the event log once the handle exists. The usage text advertises `--all` as a full-event dump, but `wmain` never branches on `--all`, so the report is always the focused PCR 0, 4, 7, and 11 set. `--probe` prints the firmware/TPM probe and exits.
 
 ```
 firmware  --hash-->  PCR 0
@@ -1152,6 +1195,23 @@ NTFS $MFT (file system)               DumpNtfsVolume.exe --volume \\.\C:
 ```
 
 A failed ESP open, a missing SMBIOS field, and a bad MFT seek are three different failures. The tool exists so the third one is not mistaken for one of the first two. It is not a step in the enrollment or the measured-boot lab.
+
+## Tests
+
+From the repository root:
+
+```
+./tests/run_tests.sh
+./tests/run_tests.sh -k "not test_headless_ovmf"   # skip the live QEMU boot
+```
+
+The suite uses pytest (`python3-pytest` on Debian). It covers:
+
+- `bash -n` and `shellcheck -x` on the lab scripts
+- Auth2 packet structure (`03_generate_auth_update.sh`, `09_sign_db_with_kek.sh`, `scripts/lib/auth2.sh`), including the 16-byte `EFI_TIME` `2026-10-04 23:30:00` UTC, the `WIN_CERTIFICATE_UEFI_GUID` header, and OpenSSL CMS verification
+- Idempotent `11_extract_and_patch_iso.sh` / `13_patch_winpe_image.sh` on a fixture ISO
+- QEMU `--dry-run` command shape, `--empty-keys`, and OVMF CODE-mismatch abort unless `--reset-vars` is passed
+- A headless OVMF + SMM + swtpm boot when the toolchain is present (see [QEMU lab features](#qemu-lab-features) for what is asserted versus skipped)
 
 ## License
 
