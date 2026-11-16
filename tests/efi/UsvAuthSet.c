@@ -10,7 +10,12 @@
  * cmds.txt lines:
  *   SET  <PK|KEK|db|dbx>  <filename>
  *   DUMP <SetupMode|SecureBoot|PK|KEK|db|dbx>
+ *   LOAD <filename>     LoadImage (and StartImage for Hello*.efi)
  * Blank lines and # comments are ignored.
+ *
+ * LoadImage is called with a FileDevicePath of the volume plus the file
+ * buffer. OVMF's security hook returns EFI_INVALID_PARAMETER when FilePath
+ * is NULL, even if SourceBuffer is set.
  */
 #include <efi.h>
 #include <efilib.h>
@@ -20,6 +25,7 @@ static EFI_GUID GV_GUID = {
     {0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C}
 };
 static EFI_HANDLE g_image;
+static EFI_HANDLE g_fs_handle;
 
 static EFI_GUID SIG_DB_GUID = {
     0xd719b2cb, 0x3d3a, 0x4596,
@@ -119,11 +125,14 @@ static EFI_STATUS open_root(EFI_HANDLE image, EFI_FILE_HANDLE *root)
     UINTN count = 0, i;
 
     *root = NULL;
+    g_fs_handle = NULL;
     st = BS->HandleProtocol(image, &LoadedImageProtocol, (void **)&li);
     if (!EFI_ERROR(st) && li && li->DeviceHandle) {
         st = open_fs_handle(li->DeviceHandle, root);
-        if (!EFI_ERROR(st) && *root)
+        if (!EFI_ERROR(st) && *root) {
+            g_fs_handle = li->DeviceHandle;
             return EFI_SUCCESS;
+        }
     }
     /* Fallback: first SimpleFileSystem volume that has cmds.txt. */
     st = BS->LocateHandleBuffer(ByProtocol, &FileSystemProtocol, NULL, &count, &handles);
@@ -138,6 +147,7 @@ static EFI_STATUS open_root(EFI_HANDLE image, EFI_FILE_HANDLE *root)
         if (!EFI_ERROR(vol->Open(vol, &probe, L"cmds.txt", EFI_FILE_MODE_READ, 0))) {
             probe->Close(probe);
             *root = vol;
+            g_fs_handle = handles[i];
             st = EFI_SUCCESS;
             break;
         }
@@ -345,12 +355,111 @@ static void emit_status(const char *op, const char *a, const char *b, EFI_STATUS
     say_ascii(line);
 }
 
+static int looks_like_hello(const char *file)
+{
+    const char *base = file;
+    const char *p;
+    for (p = file; *p; p++) {
+        if (*p == '\\' || *p == '/')
+            base = p + 1;
+    }
+    return (base[0] == 'H' || base[0] == 'h')
+        && (base[1] == 'e' || base[1] == 'E')
+        && (base[2] == 'l' || base[2] == 'L')
+        && (base[3] == 'l' || base[3] == 'L')
+        && (base[4] == 'o' || base[4] == 'O');
+}
+
+static void ascii_to_path(const char *name, CHAR16 *out, UINTN cap)
+{
+    UINTN i = 0, j = 0;
+    if (cap < 2) {
+        if (cap)
+            out[0] = 0;
+        return;
+    }
+    if (name[0] != '\\' && name[0] != '/')
+        out[j++] = L'\\';
+    for (i = 0; name[i] && j + 1 < cap; i++, j++) {
+        char c = name[i];
+        out[j] = (CHAR16)(UINT8)((c == '/') ? '\\' : c);
+    }
+    out[j] = 0;
+}
+
+static UINTN dp_size(EFI_DEVICE_PATH *dp)
+{
+    UINTN n = 0;
+    if (!dp)
+        return 0;
+    while (!IsDevicePathEnd(dp)) {
+        UINTN l = DevicePathNodeLength(dp);
+        if (l < 4)
+            break;
+        n += l;
+        dp = NextDevicePathNode(dp);
+    }
+    return n + sizeof(EFI_DEVICE_PATH);
+}
+
+static EFI_DEVICE_PATH *make_file_dp(CHAR16 *wname, int with_device)
+{
+    UINTN name_len = 0, file_node_size, prefix = 0, total;
+    EFI_DEVICE_PATH *dev = NULL;
+    EFI_DEVICE_PATH *out;
+    FILEPATH_DEVICE_PATH *fp;
+    EFI_DEVICE_PATH *end;
+
+    while (wname[name_len])
+        name_len++;
+    file_node_size = SIZE_OF_FILEPATH_DEVICE_PATH + (name_len + 1) * sizeof(CHAR16);
+
+    if (with_device && g_fs_handle) {
+        EFI_STATUS st;
+        st = BS->HandleProtocol(g_fs_handle, &DevicePathProtocol, (void **)&dev);
+        if (EFI_ERROR(st))
+            dev = NULL;
+    }
+    if (dev) {
+        UINTN sz = dp_size(dev);
+        if (sz >= sizeof(EFI_DEVICE_PATH))
+            prefix = sz - sizeof(EFI_DEVICE_PATH);
+    }
+    total = prefix + file_node_size + sizeof(EFI_DEVICE_PATH);
+    out = AllocateZeroPool(total);
+    if (!out)
+        return NULL;
+    if (prefix && dev)
+        CopyMem(out, dev, prefix);
+    fp = (FILEPATH_DEVICE_PATH *)((UINT8 *)out + prefix);
+    fp->Header.Type = MEDIA_DEVICE_PATH;
+    fp->Header.SubType = MEDIA_FILEPATH_DP;
+    SetDevicePathNodeLength(&fp->Header, file_node_size);
+    CopyMem(fp->PathName, wname, (name_len + 1) * sizeof(CHAR16));
+    end = (EFI_DEVICE_PATH *)((UINT8 *)fp + file_node_size);
+    SetDevicePathEndNode(end);
+    return out;
+}
+
+static int is_invalid_param(EFI_STATUS st)
+{
+    return EFI_ERROR(st) && ((st & 0xFF) == (EFI_INVALID_PARAMETER & 0xFF));
+}
+
+static void emit_try(const char *file, const char *how, EFI_STATUS st)
+{
+    emit_status("LOAD_TRY", file, how, st);
+}
+
 static void do_load(EFI_FILE_HANDLE root, const char *file)
 {
-    EFI_STATUS st;
+    EFI_STATUS st = EFI_INVALID_PARAMETER;
     void *buf = NULL;
     UINTN size = 0;
     EFI_HANDLE loaded = NULL;
+    EFI_DEVICE_PATH *full = NULL;
+    EFI_DEVICE_PATH *bare = NULL;
+    CHAR16 wname[160];
 
     st = read_file(root, file, &buf, &size);
     if (EFI_ERROR(st) || !buf) {
@@ -359,11 +468,51 @@ static void do_load(EFI_FILE_HANDLE root, const char *file)
             FreePool(buf);
         return;
     }
-    st = BS->LoadImage(FALSE, g_image, NULL, buf, size, &loaded);
-    if (!EFI_ERROR(st) && loaded)
-        BS->UnloadImage(loaded);
-    FreePool(buf);
+
+    ascii_to_path(file, wname, 160);
+    /* Build the path ourselves. libefi FileDevicePath may be a different ABI
+       than this image (we compile with GNU_EFI_USE_MS_ABI). */
+    full = make_file_dp(wname, 1);
+    bare = make_file_dp(wname, 0);
+
+    /* Prefer FilePath + SourceBuffer (OVMF's security hook wants a path). */
+    if (full) {
+        st = BS->LoadImage(FALSE, g_image, full, buf, size, &loaded);
+        emit_try(file, "full+buf", st);
+    }
+    if (is_invalid_param(st) && full) {
+        st = BS->LoadImage(FALSE, g_image, full, NULL, 0, &loaded);
+        emit_try(file, "full", st);
+    }
+    if (is_invalid_param(st) && bare) {
+        st = BS->LoadImage(FALSE, g_image, bare, buf, size, &loaded);
+        emit_try(file, "bare+buf", st);
+    }
+    if (is_invalid_param(st) && full) {
+        st = BS->LoadImage(TRUE, g_image, full, buf, size, &loaded);
+        emit_try(file, "boot+full+buf", st);
+    }
+    /* Some firmware returns ACCESS_DENIED (0x0f) rather than
+       SECURITY_VIOLATION (0x1a) for an unsigned image. Record it as-is. */
     emit_status("LOAD", file, NULL, st);
+
+    /* Start Hello*.efi so the serial log shows USV_HELLO_OK. Never start
+       EFI/BOOT/BOOTX64.EFI (the Shell) or this helper will not return. */
+    if (!EFI_ERROR(st) && loaded && looks_like_hello(file)) {
+        EFI_STATUS st2;
+        st2 = BS->StartImage(loaded, NULL, NULL);
+        emit_status("START", file, NULL, st2);
+        if (EFI_ERROR(st2))
+            BS->UnloadImage(loaded);
+    } else if (!EFI_ERROR(st) && loaded) {
+        BS->UnloadImage(loaded);
+    }
+
+    if (full)
+        FreePool(full);
+    if (bare)
+        FreePool(bare);
+    FreePool(buf);
 }
 
 static void run_cmds(EFI_FILE_HANDLE root, char *text, UINTN size)
@@ -400,8 +549,14 @@ static void run_cmds(EFI_FILE_HANDLE root, char *text, UINTN size)
     }
 }
 
+/*
+ * efi_main is deliberately not EFIAPI: Debian gnu-efi _entry calls it
+ * SysV. GNU_EFI_USE_MS_ABI still applies to EFI_BOOT_SERVICES /
+ * EFI_RUNTIME_SERVICES function pointers. A prior EFIAPI efi_main left
+ * g_image / ImageHandle unset, so LoadImage always returned
+ * EFI_INVALID_PARAMETER.
+ */
 EFI_STATUS
-EFIAPI
 efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_FILE_HANDLE root = NULL;

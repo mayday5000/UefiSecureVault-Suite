@@ -24,6 +24,9 @@ trap 'rm -rf "$workdir"' EXIT
 obj="$workdir/UsvAuthSet.o"
 so="$workdir/UsvAuthSet.so"
 
+# -DGNU_EFI_USE_MS_ABI makes EFIAPI = ms_abi so Boot/Runtime service
+# calls match the firmware. Debian's prebuilt crt0/_entry still call
+# efi_main with the SysV ABI, so efi_main itself must not be EFIAPI.
 CFLAGS=(
     -I"$INC" -I"$INC/$ARCH"
     -fpic -ffreestanding -fno-stack-protector -fno-stack-check

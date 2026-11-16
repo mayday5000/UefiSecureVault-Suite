@@ -32,13 +32,17 @@ PKCS7_GUID = bytes.fromhex("9dd2af4adf68ee498aa9347d375665a7")
 WIN_CERT_REVISION = 0x0200
 WIN_CERT_TYPE_EFI_GUID = 0x0EF1
 SIGN_TS = "2026-10-04 23:30:00"
-# EFI_SECURITY_VIOLATION
+# EFI_SECURITY_VIOLATION / EFI_ACCESS_DENIED (OVMF may return either for unsigned images)
 EFI_SECURITY_VIOLATION = 0x8000001A
+EFI_ACCESS_DENIED = 0x8000000F
 
 PHASE1_NSH = """@echo -off
 echo USV_SCRIPT_START
 echo USV_FIRST_BOOT
 UsvAuthSet.efi
+echo USV_SIGNED_HELLO
+HelloSigned.efi
+echo USV_SIGNED_RC %lasterror%
 echo USV_PHASE1_DONE
 reset -s
 """
@@ -47,6 +51,9 @@ PHASE2_NSH = """@echo -off
 echo USV_SCRIPT_START
 echo USV_SECOND_BOOT
 UsvAuthSet.efi
+echo USV_SIGNED_HELLO
+HelloSigned.efi
+echo USV_SIGNED_RC %lasterror%
 echo USV_PHASE2_DONE
 reset -s
 """
@@ -356,23 +363,88 @@ def _status_code(st: int | None) -> int | None:
 
 
 def _assert_signed_unsigned_load(text: str, readable: str, label: str) -> None:
-    """Prefer LoadImage evidence; do not fail enrollment if the helper cannot LoadImage."""
+    """After PK enrollment, signed Hello must Load/Start (0); unsigned must be rejected.
+
+    This OVMF returns EFI_ACCESS_DENIED (0x0f) for an unsigned LoadImage once
+    keys are enrolled. The UEFI spec also allows EFI_SECURITY_VIOLATION (0x1a);
+    either rejection is a pass. A zero or EFI_INVALID_PARAMETER (0x2) is not.
+    """
     signed_st = _parse_load(text, "HelloSigned.efi")
     unsigned_st = _parse_load(text, "HelloUnsigned.efi")
     bootx64_st = _parse_load(text, "EFI/BOOT/BOOTX64.EFI")
-    print(f"NOTE {label} LOAD HelloSigned={signed_st} HelloUnsigned={unsigned_st} BOOTX64={bootx64_st}")
-    if signed_st == 0 and unsigned_st not in (None, 0):
-        return
-    # 0x8000000000000002 / 0x80000002 EFI_INVALID_PARAMETER: gnu-efi LoadImage
-    # from this helper is not usable on this OVMF; enrollment itself succeeded.
-    if _status_code(signed_st) == 2 and _status_code(unsigned_st) == 2:
-        print(
-            f"NOTE {label}: LoadImage returned EFI_INVALID_PARAMETER for both "
-            "signed and unsigned images; signed-versus-unsigned EFI is not asserted."
+    signed_start = _parse_start(text, "HelloSigned.efi")
+    unsigned_start = _parse_start(text, "HelloUnsigned.efi")
+    print(
+        f"NOTE {label} LOAD HelloSigned={signed_st} HelloUnsigned={unsigned_st} "
+        f"BOOTX64={bootx64_st} START signed={signed_start} unsigned={unsigned_start}"
+    )
+    rejected = {
+        EFI_SECURITY_VIOLATION & 0x7FFFFFFF,  # 0x1a
+        EFI_ACCESS_DENIED & 0x7FFFFFFF,  # 0x0f, what this OVMF actually returns
+    }
+    assert signed_st == 0, (
+        f"{label} signed Hello failed to LoadImage: {signed_st}\n{readable[-4000:]}"
+    )
+    assert _status_code(unsigned_st) in rejected, (
+        f"{label} unsigned Hello: expected EFI_SECURITY_VIOLATION (0x1a) or "
+        f"EFI_ACCESS_DENIED (0x0f), got {unsigned_st}\n{readable[-4000:]}"
+    )
+    assert signed_start == 0, (
+        f"{label} signed Hello failed to StartImage: {signed_start}\n{readable[-4000:]}"
+    )
+    assert unsigned_start is None, (
+        f"{label} unsigned Hello should not have been StartImage'd: "
+        f"{unsigned_start}\n{readable[-4000:]}"
+    )
+    assert "USV_HELLO_OK" in text, (
+        f"{label} signed Hello did not print USV_HELLO_OK:\n{readable[-4000:]}"
+    )
+    if "USV_SIGNED_HELLO" in text:
+        signed_chunk = text.split("USV_SIGNED_HELLO", 1)[-1]
+        if "USV_UNSIGNED_HELLO" in signed_chunk:
+            signed_chunk = signed_chunk.split("USV_UNSIGNED_HELLO", 1)[0]
+        assert "USV_HELLO_OK" in signed_chunk, (
+            f"{label} Shell-launched signed Hello did not run:\n{readable[-4000:]}"
         )
-        return
-    assert signed_st == 0, f"{label} signed Hello failed to load: {signed_st}\n{readable[-4000:]}"
-    assert unsigned_st not in (None, 0), f"{label} unsigned Hello was not blocked: {unsigned_st}\n{readable[-4000:]}"
+        if "USV_SIGNED_RC" in text:
+            assert not _rc_is_failure(text, "USV_SIGNED_RC"), (
+                f"{label} signed Hello lasterror failed:\n{readable[-3000:]}"
+            )
+            signed_rc = _parse_rc(text, "USV_SIGNED_RC")
+            if signed_rc is not None:
+                assert signed_rc == 0, (
+                    f"{label} signed Hello lasterror={signed_rc}\n{readable[-3000:]}"
+                )
+    if bootx64_st not in (None, 0) and _status_code(bootx64_st) == 2:
+        print(f"NOTE {label}: LoadImage of signed BOOTX64.EFI still {bootx64_st}")
+    elif bootx64_st is not None:
+        assert bootx64_st == 0, (
+            f"{label} signed Shell failed to LoadImage: {bootx64_st}\n{readable[-4000:]}"
+        )
+
+
+def _parse_rc(text: str, marker: str) -> int | None:
+    for line in text.splitlines():
+        if marker not in line:
+            continue
+        tail = line.split(marker, 1)[-1].strip().lstrip("=")
+        if not tail:
+            return None
+        token = tail.split()[0].rstrip(".")
+        try:
+            return int(token, 16) if all(c in "0123456789abcdefABCDEF" for c in token) else int(token, 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_start(text: str, filename: str) -> int | None:
+    # USV_STATUS START HelloSigned.efi 0x00000000
+    pat = re.compile(rf"USV_STATUS START {re.escape(filename)} 0x([0-9a-fA-F]+)")
+    matches = pat.findall(text)
+    if not matches:
+        return None
+    return int(matches[-1], 16)
 
 def _parse_status(text: str, var: str, filename: str) -> int | None:
     # USV_STATUS SET db db.auth 0x00000000
