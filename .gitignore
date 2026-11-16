@@ -1,0 +1,11 @@
+# Generated lab state (see "Files that are lab state" in README.md)
+workspace/
+OVMF_VARS.fd
+OVMF_CODE.fd
+tmp_iso_extract/
+*.iso
+*.key
+*.auth
+*.esl
+*.efi
+*.exe

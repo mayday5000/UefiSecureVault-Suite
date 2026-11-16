@@ -1,0 +1,31 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = SecureManagerApp
+  FILE_GUID                      = 8fbb234e-f0f4-11ed-8fbb-b04f1300971a
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 2.0
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  SecureManagerApp.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  BaseLib
+
+[Protocols]
+  gEfiSimpleFileSystemProtocolGuid
+
+[Guids]
+  gEfiGlobalVariableGuid
+  gEfiImageSecurityDatabaseGuid
+  gEfiCertSha256Guid
+  gEfiCertX509Guid
+  gEfiFileInfoGuid
