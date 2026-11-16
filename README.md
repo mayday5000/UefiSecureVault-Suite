@@ -21,9 +21,9 @@ This repository provides an automated end-to-end framework to construct a privat
 - `08_cosign_application.sh`: Applies multi-signature layouts to a single `.efi` binary, appending an independent cryptographic trailer to test sequential Image Loader gate structures. Optional arguments are the input signed image and the co-signed output.
 - `09_sign_db_with_kek.sh`: Packages an existing whitelist `.esl` into an `.auth` envelope signed explicitly by the custom KEK private key, so the update can cross a User Mode lockdown. Optional arguments are the `.esl` path and `db` or `dbx`.
 - `10_simulate_integrity_violation.sh`: Clones an authenticated packet and intentionally flips internal bytes, creating a signature violation to test hardware verification failures. Optional arguments select the valid packet and the corrupted output.
-- `11_extract_and_patch_iso.sh`: Unpacks a vanilla installation disk image, embeds the automated unattend script, injects the custom-signed bootloader, and recompiles a deployment ISO (`windows_patched.iso`). `--iso`, `--signed-efi`, `--output`, and `--keep-tree` select the media, the replacement loader, the output image, and whether the unpacked tree stays on disk for WinPE injection. This file absorbs the earlier second ISO patcher.
+- `11_extract_and_patch_iso.sh`: Unpacks a vanilla installation disk image, embeds the automated unattend script, injects the custom-signed bootloader, and recompiles a deployment ISO (`windows_patched.iso`). Modes are `--extract`, `--patch`, `--rebuild`, `--all` (the default: extract + patch + rebuild), `--clean`, and `--force`. The unpacked tree is kept by default; `--keep-tree` is accepted and ignored. Stamps in `tmp_iso_extract/` (`.stamp_extract`, `.stamp_patch_iso`, `.stamp_winpe`) make reruns idempotent. `--iso`, `--signed-efi`, and `--output` select the media, the replacement loader, and the output image.
 - `12_run_patched_iso_qemu.sh`: Launches a nested Hyper-V virtual environment by setting extended CPU virtualization pass-through topologies (`hv_synic`, `hv_stimer`, and the rest of the enlightenment set). `--no-nested` drops those bits. `--memory`, `--smp`, and `--disk` shape the guest.
-- `13_patch_winpe_image.sh`: Mounts `boot.wim` index 2, injects the Win32 user-mode diagnostics into `System32`, applies `winpeshl.ini`, and stages the `.efi` applications on the media root. The optional argument is the unpacked ISO directory, default `tmp_iso_extract`.
+- `13_patch_winpe_image.sh`: Mounts `boot.wim` index 2, injects the Win32 user-mode diagnostics into `System32`, applies `winpeshl.ini`, and stages the `.efi` applications on the media root. Restores `boot.wim` from `tmp_iso_state/boot.wim.orig` before a redo so injections do not stack, and writes `.stamp_winpe` so a matching rerun is a no-op. The optional argument is the unpacked ISO directory, default `tmp_iso_extract`.
 - `14_compile_win32_diagnostics.sh`: Cross-compiles the Ring 3 verification tools from Linux with `x86_64-w64-mingw32-g++ -O2 -static`, and stages the executables in `workspace/`.
 - `deploy_suite.sh`: Orchestrates the EDK2 build of `SecureManagerApp` and `SignatureParserApp` and stages the `.efi` binaries into `workspace/`. In this tree the same script is also named `15_deploy_uefi_apps.sh`. `EDK2_ROOT`, `TARGET_ARCH`, `TARGET_TOOLCHAIN`, and `BUILD_TARGET` are environment overrides.
 - `16_verify_signatures.sh`: Host-side OpenSSL inspection of a detached `.p7b`, an X.509 certificate, an `.esl` header, or a CMS blob. Modes are `p7b`, `x509`, `esl`, and `cms`.
@@ -67,7 +67,7 @@ Method 2: Offline Windows Preinstallation Environment (WinPE)
 
 This environment tests code integrity as the setup environment takes over system memory.
 
-- The Workflow: Execute `14_compile_win32_diagnostics.sh`, then `13_patch_winpe_image.sh`. That mounts `boot.wim`, injects `VerifyRuntimeBoundaries.exe` and `AuditMeasuredBootLog.exe`, and applies the `winpeshl.ini` hook. Rebuild with `11_extract_and_patch_iso.sh` and boot with `12_run_patched_iso_qemu.sh`.
+- The Workflow: Execute `14_compile_win32_diagnostics.sh`, then `./11_extract_and_patch_iso.sh --extract --patch`, then `13_patch_winpe_image.sh`. That mounts `boot.wim`, injects `VerifyRuntimeBoundaries.exe` and `AuditMeasuredBootLog.exe`, and applies the `winpeshl.ini` hook. Rebuild with `./11_extract_and_patch_iso.sh --rebuild` and boot with `12_run_patched_iso_qemu.sh`.
 - The Verification: WinPE bypasses the QEMU hardware floor and opens a privileged `cmd.exe` before the Windows setup panel. `VerifyRuntimeBoundaries.exe` audits how the Windows executive protects firmware variables before a single file is committed to the main partition.
 
 Method 3: Live OS Memory Attestation & Hyper-V Verification
@@ -100,18 +100,21 @@ sudo umount tmp_mnt && rmdir tmp_mnt
 # Step 5: Cross-compile your Ring 3 diagnostic executables from the host
 ./14_compile_win32_diagnostics.sh
 
-# Step 6: Inject the custom diagnostics and startup hooks into the WinPE image matrix
-./11_extract_and_patch_iso.sh --keep-tree
+# Step 6: Unpack and patch the media tree, then inject WinPE diagnostics
+./11_extract_and_patch_iso.sh --extract --patch
 ./13_patch_winpe_image.sh
 
-# Step 7: Repatch the installation ISO and inject the hardware check bypasses
-./11_extract_and_patch_iso.sh
+# Step 7: Rebuild windows_patched.iso from the existing tree (keeps the WinPE injection)
+./11_extract_and_patch_iso.sh --rebuild
+
+# ISO-only path (no WinPE injection): unpack, patch, and rebuild in one step
+# ./11_extract_and_patch_iso.sh --all
 
 # Step 8: Launch the nested hypervisor environment to begin analysis
 ./12_run_patched_iso_qemu.sh
 ```
 
-Step 6 needs the unpacked tree, so `--keep-tree` comes before `13_patch_winpe_image.sh`. Step 7 rebuilds `windows_patched.iso` after the WinPE injection. `deploy_suite.sh` is the missing compile step when `SecureManagerApp.efi` and `SignatureParserApp.efi` are not already in `workspace/`.
+Step 6 unpacks and patches the tree (`--extract --patch`) and then injects WinPE. Step 7 must be `--rebuild` only: a second `--all` would try to extract again and, once `.stamp_winpe` is present, refuse unless `--force` is passed. `--all` is the ISO-only path when you do not need WinPE. The tree is kept by default; `--clean` deletes `tmp_iso_extract/` and `tmp_iso_state/`. `deploy_suite.sh` is the missing compile step when `SecureManagerApp.efi` and `SignatureParserApp.efi` are not already in `workspace/`.
 
 ## Core Security Concepts Covered
 
@@ -328,7 +331,7 @@ The firmware shell and the Windows diagnostics are not two copies of the same re
 
 ![Authenticated packets, clocks, and the violation file](assets/21-authenticated-packets.jpg)
 
-`03_generate_auth_update.sh` and `09_sign_db_with_kek.sh` build the same envelope shape. An `EFI_TIME` prefix, a `WIN_CERTIFICATE_UEFI_GUID` PKCS#7 signature, then the signature-list payload. The static laboratory clock is `2026-10-04 23:15:00`, packed as `EA 07 0A 04 17 1E 00 00`: little-endian year, then month, day, hour, minute, second, pad. Dynamic mode recomputes those eight bytes from the host clock in UTC. A negative offset moves that clock backward. `SecureManagerApp.efi` reads the stored `dbt` entries back out as `YYYY-MM-DD HH:MM:SS GMT`. If the banner does not match the clock the script printed, the packet that landed is not the packet that was just generated.
+`03_generate_auth_update.sh` and `09_sign_db_with_kek.sh` build the same envelope shape. A 16-byte `EFI_TIME` prefix, a `WIN_CERTIFICATE_UEFI_GUID` header (length, revision `0x0200`, type `0x0EF1`, `EFI_CERT_TYPE_PKCS7_GUID`), a detached PKCS#7 SignedData, then the signature-list payload. The static laboratory clock is `2026-10-04 23:30:00` UTC, packed as the 16-byte `EFI_TIME` `EA 07 0A 04 17 1E 00 00` followed by eight zero bytes (Nanosecond, TimeZone, Daylight, Pad2). The first eight bytes are little-endian year, then month, day, hour, minute (`0x1E` = 30), second, and Pad1. Dynamic mode recomputes the full 16-byte `EFI_TIME` from the host clock in UTC, with the trailing fields still zero. A negative offset moves that clock backward. `SecureManagerApp.efi` reads the stored `dbt` entries back out as `YYYY-MM-DD HH:MM:SS GMT`. If the banner does not match the clock the script printed, the packet that landed is not the packet that was just generated. The signed bytes are VariableName (UTF-16LE, no NUL), VendorGuid, Attributes, that `EFI_TIME`, and the ESL. `PK` and `KEK` packets use the Global Variable GUID in mixed-endian form `61dfe48bca93d211aa0d00e098032b8c`.
 
 The SHA-256 list header used for a single hash is fixed: type GUID `{c1c41626-504c-4092-aca9-41f936934328}`, list size 76, header size 0, signature size 48. Owner GUID bytes from `uuidgen` are field-swapped so the firmware's mixed-endian GUID matches the printed value. `cert-to-efi-sig-list -g` does that swap itself. A GUID handed to `-g` must not be swapped a second time.
 
@@ -344,7 +347,7 @@ The short quick-start is the media path. The firmware-only path does not need an
 
 The media path starts from a vanilla ISO so the vendor loader can be compared with the lab loader. `04_extract_ms_certs.sh` isolates `ms_winboot_signature.p7b`. `16_verify_signatures.sh` prints that chain on the host. `05_sign_custom_winboot.sh` writes `winboot_signed.efi` without destroying `winboot.efi`. `08_cosign_application.sh` is optional and only meaningful if `sbverify --list` shows two trailers afterward.
 
-`11_extract_and_patch_iso.sh` is the xorriso unpack and rebuild. It needs `xorriso` and `wimtools`. `--keep-tree` leaves `tmp_iso_extract/` so `13_patch_winpe_image.sh` can mount `sources/boot.wim` index 2. The WinPE script copies `VerifyRuntimeBoundaries.exe`, `AuditMeasuredBootLog.exe` when it exists, and `winpeshl.ini` into `Windows\System32`, and copies both `.efi` applications to the ISO root so the firmware shell can see them before setup starts. A rebuild after that commit is what puts the injection inside the ISO that step 12 boots. Step 12 will not start without `OVMF_CODE.fd` and `OVMF_VARS.fd` from a prior `02_run_qemu.sh` run.
+`11_extract_and_patch_iso.sh` is the xorriso unpack, patch, and rebuild. It needs `xorriso`. The default `--all` path (extract + patch + rebuild) is for ISO-only work. The WinPE path is `--extract --patch`, then `13_patch_winpe_image.sh`, then `--rebuild`. The tree in `tmp_iso_extract/` is kept by default. `--keep-tree` is deprecated and ignored; `--clean` deletes the tree and `tmp_iso_state/`. Extract writes `.stamp_extract` (SHA-256 of the source ISO) and copies `sources/boot.wim` to `tmp_iso_state/boot.wim.orig`, which is never packed into the ISO. Patch writes `.stamp_patch_iso` from `autounattend.xml` and the signed loader. Matching stamps are skipped unless `--force` is passed. `--all` and `--extract` refuse to extract over a tree that has `.stamp_winpe` unless `--force`. The WinPE script mounts `sources/boot.wim` index 2, restores that original first so injections do not stack, copies `VerifyRuntimeBoundaries.exe`, `AuditMeasuredBootLog.exe` when it exists, and `winpeshl.ini` into `Windows\System32`, copies both `.efi` applications to the ISO root, and writes `.stamp_winpe`. `--rebuild` runs xorriso against the existing tree, which is what puts the injection inside the ISO that step 12 boots. Step 12 will not start without `OVMF_CODE.fd` and `OVMF_VARS.fd` from a prior `02_run_qemu.sh` run.
 
 `winpeshl.ini` uses the `LaunchApps` comma separator. `cmd.exe /k` keeps the diagnostic window open. `setup.exe` is last. Removing it leaves the lab at the diagnostics and never installs. Putting a diagnostic after `setup.exe` hides the result until setup returns, which is too late for a pre-install measurement.
 
@@ -358,7 +361,7 @@ A crypto-agile log has a different header. If the walk stops immediately on a mo
 
 ## Files that are lab state
 
-`workspace/`, `OVMF_VARS.fd`, `OVMF_CODE.fd`, `tmp_iso_extract/`, and the vanilla ISOs are generated state, not source. `OVMF_VARS.fd` contains the Platform Key enrollment. `workspace/certs/*.key` is the ability to write that policy. Neither belongs in a commit. `WinVerifyTrust.cpp` keeps the Microsoft sample copyright line. The rest of the tree is lab code for machines you administer.
+`workspace/`, `OVMF_VARS.fd`, `OVMF_CODE.fd`, `tmp_iso_extract/`, `tmp_iso_state/`, `tmp_wim_mount/`, and the vanilla ISOs are generated state, not source. `OVMF_VARS.fd` contains the Platform Key enrollment. `workspace/certs/*.key` is the ability to write that policy. `tmp_iso_state/boot.wim.orig` is the pristine WinPE image used to redo an injection. Neither belongs in a commit. `WinVerifyTrust.cpp` keeps the Microsoft sample copyright line. The rest of the tree is lab code for machines you administer.
 
 ## Per-Tool Reference
 
@@ -468,7 +471,7 @@ Use cases: a User Mode whitelist append; a hash blacklist; a backdated packet th
         workspace/update_target_<var>.auth
 ```
 
-`--static` stamps the fixed baseline `2026-10-04 23:15:00`. `--dynamic` uses the host clock. A negative offset such as `-7200` is how the lab produces a packet the anti-replay counter should refuse.
+`--static` stamps the fixed baseline `2026-10-04 23:30:00` UTC as a 16-byte `EFI_TIME`. `--dynamic` uses the host clock. A negative offset such as `-7200` is how the lab produces a packet the anti-replay counter should refuse.
 
 #### `04_extract_ms_certs.sh`
 
@@ -601,11 +604,14 @@ Purpose: clone a valid authenticated packet and flip internal bytes so the firmw
 
 #### `11_extract_and_patch_iso.sh`
 
-Purpose: unpack a vanilla ISO, embed `autounattend.xml`, replace the bootloader, and rebuild `windows_patched.iso`.
+Purpose: unpack a vanilla ISO, embed `autounattend.xml`, replace the bootloader, and rebuild `windows_patched.iso`. Modes: `--extract`, `--patch`, `--rebuild`, `--all`, `--clean`, `--force`.
 
 ```
-./11_extract_and_patch_iso.sh
-./11_extract_and_patch_iso.sh --iso windows11_vanilla.iso --signed-efi workspace/winboot_signed.efi --output workspace/windows_patched.iso --keep-tree
+./11_extract_and_patch_iso.sh --all
+./11_extract_and_patch_iso.sh --extract --patch
+./11_extract_and_patch_iso.sh --rebuild
+./11_extract_and_patch_iso.sh --clean
+./11_extract_and_patch_iso.sh --iso windows11_vanilla.iso --signed-efi workspace/winboot_signed.efi --output workspace/windows_patched.iso --all
 ```
 
 ```
@@ -613,14 +619,24 @@ Purpose: unpack a vanilla ISO, embed `autounattend.xml`, replace the bootloader,
                     |
                     v
            +------------------------+
-           | 11_extract_and_patch   |
+           | 11 --extract --patch   |
+           |   .stamp_extract       |
+           |   .stamp_patch_iso     |
            +------------------------+
                     |
+                    +--> tmp_iso_extract/          (kept by default)
+                    +--> tmp_iso_state/boot.wim.orig
+                    |
+                    v
+           13_patch_winpe_image.sh   (.stamp_winpe)
+                    |
+                    v
+           11 --rebuild
+                    |
                     +--> workspace/windows_patched.iso
-                    +--> tmp_iso_extract/   (only with --keep-tree)
 ```
 
-`--keep-tree` is required before `13_patch_winpe_image.sh`.
+`--all` (the default) is the ISO-only path: extract, patch, and rebuild. The WinPE path is `--extract --patch`, then `13`, then `--rebuild`. `--extract` / `--all` refuse to re-extract over `.stamp_winpe` unless `--force`. `--keep-tree` is deprecated and ignored. `--clean` deletes the tree and `tmp_iso_state/`.
 
 #### `12_run_patched_iso_qemu.sh`
 
@@ -668,7 +684,7 @@ Purpose: mount `boot.wim` index 2, inject the Win32 diagnostics and `winpeshl.in
             +--> ISO root SignatureParserApp.efi
 ```
 
-Run `14` (or `build_win32.ps1`) first, and `11 --keep-tree` before this.
+Run `14` (or `build_win32.ps1`) first, and `11 --extract --patch` before this. After a successful injection, rebuild with `11 --rebuild`. A matching `.stamp_winpe` makes a rerun a no-op; a changed input restores `boot.wim` from `tmp_iso_state/boot.wim.orig` first so injections do not stack.
 
 #### `14_compile_win32_diagnostics.sh`
 

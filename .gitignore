@@ -9,3 +9,5 @@ tmp_iso_extract/
 *.esl
 *.efi
 *.exe
+tmp_iso_state/
+tmp_wim_mount/
