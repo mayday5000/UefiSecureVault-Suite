@@ -1136,3 +1136,9 @@ NTFS $MFT (file system)               DumpNtfsVolume.exe --volume \\.\C:
 ```
 
 A failed ESP open, a missing SMBIOS field, and a bad MFT seek are three different failures. The tool exists so the third one is not mistaken for one of the first two. It is not a step in the enrollment or the measured-boot lab.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
+
+Third-party components and tools keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
