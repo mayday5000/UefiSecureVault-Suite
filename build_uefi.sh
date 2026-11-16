@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # UefiSecureVault-Suite — build_uefi.sh
 # Always probes the host. If the toolchain is incomplete, installs the missing
-# packages (QEMU, OVMF, EDK2 build dependencies, signing tools). Clones EDK2
+# packages (QEMU, OVMF, swtpm, EDK2 build dependencies, signing tools). Clones EDK2
 # only when EDK2_ROOT does not already contain a tree. Builds BaseTools if
 # needed, then compiles SecureManagerApp.efi and SignatureParserApp.efi into
 # ./workspace.
@@ -172,7 +172,10 @@ install_packages() {
                 python3 git gcc g++ make \
                 qemu-system-x86 qemu-utils ovmf \
                 openssl xxd uuid-runtime \
-                efitools sbsigntools pesign
+                efitools pesign \
+                swtpm swtpm-tools libtpms0 tpm2-tools
+            # Debian ships sbsigntool (singular); some other apt distros use sbsigntools.
+            $SUDO apt-get install -y sbsigntool || $SUDO apt-get install -y sbsigntools
             $SUDO apt-get install -y iasl python3-distutils 2>/dev/null || true
             ;;
         dnf)
@@ -180,14 +183,16 @@ install_packages() {
                 gcc gcc-c++ make git python3 nasm acpica-tools \
                 qemu-system-x86 qemu-img edk2-ovmf \
                 openssl util-linux \
-                efitools sbsigntools pesign
+                efitools sbsigntools pesign \
+                swtpm swtpm-tools libtpms tpm2-tools
             ;;
         pacman)
             $SUDO pacman -Sy --needed --noconfirm \
                 base-devel git python nasm acpica \
                 qemu-system-x86 edk2-ovmf \
                 openssl util-linux \
-                sbsigntools
+                sbsigntools \
+                swtpm tpm2-tools
             ;;
         *)
             echo "[-] No supported package manager (apt-get, dnf, pacman)."

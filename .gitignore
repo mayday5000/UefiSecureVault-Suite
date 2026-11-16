@@ -1,5 +1,6 @@
 # Generated lab state (see "Files that are lab state" in README.md)
 workspace/
+# workspace/ also covers workspace/ovmf/, workspace/tpm/, and workspace/logs/
 OVMF_VARS.fd
 OVMF_CODE.fd
 tmp_iso_extract/
@@ -11,3 +12,8 @@ tmp_iso_extract/
 *.exe
 tmp_iso_state/
 tmp_wim_mount/
+
+# Test runner debris
+__pycache__/
+.pytest_cache/
+*.pyc

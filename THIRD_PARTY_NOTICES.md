@@ -32,9 +32,12 @@ The scripts call these tools from the host. None of them is included in this rep
 |---|---|---|
 | QEMU | virtual machine | GPL-2.0 |
 | OVMF (EDK II) | UEFI firmware for QEMU | BSD-2-Clause-Patent |
+| swtpm | TPM 2.0 emulator for the QEMU lab | BSD-3-Clause |
+| libtpms | TPM library used by swtpm | BSD-3-Clause |
+| tpm2-tools | Host PCR / TPM inspection in tests | BSD-3-Clause |
 | OpenSSL | keys, certificates, CMS | Apache-2.0 (3.x) |
 | efitools | `cert-to-efi-sig-list` (`.esl` generation) | GPL-2.0 |
-| sbsigntools | `sbattach` | GPL-3.0 |
+| sbsigntools (Debian: sbsigntool) | `sbattach`, `sbsign` | GPL-3.0 |
 | pesign / NSS | PE signing (`pesign`, `certutil`, `pk12util`) | GPL-2.0 / MPL-2.0 |
 | xorriso | ISO extract and rebuild | GPL-3.0 |
 | wimlib | `boot.wim` patching | GPL-3.0 / LGPL-3.0 |

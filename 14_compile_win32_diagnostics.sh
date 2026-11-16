@@ -13,7 +13,7 @@ if ! command -v x86_64-w64-mingw32-g++ &> /dev/null; then
 fi
 
 mkdir -p workspace
-CXX="x86_64-w64-mingw32-g++ -O2 -static -Wall"
+CXX="x86_64-w64-mingw32-g++ -O2 -static -Wall -municode"
 
 compile_one() {
     local src="$1"
